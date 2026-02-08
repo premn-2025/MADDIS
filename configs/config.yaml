@@ -1,0 +1,142 @@
+# Multi-Agent AI Drug Discovery Pipeline - Comprehensive Configuration
+
+# Data Collection Settings
+data:
+  cache_dir: ./data/cache
+  chembl_version: '33'
+  output_dir: ./outputs
+  max_molecules_per_target: 10000
+  timeout: 30  # seconds for API calls
+
+# Molecular Docking
+docking:
+  energy_range: 3
+  exhaustiveness: 8
+  num_poses: 9
+  binding_site:
+    auto_detect: true
+    default_size: [20.0, 20.0, 20.0]
+
+# LLM Orchestration
+llm:
+  max_tokens: 2000
+  model: gpt-4-turbo-preview
+  provider: openai  # 'openai', 'anthropic', 'fallback'
+  temperature: 0.7
+  timeout: 30
+
+# Machine Learning Models
+models:
+  batch_size: 32
+  device: auto  # 'auto', 'cpu', 'cuda'
+  max_epochs: 100
+  early_stopping: true
+  random_state: 42
+  
+  # Model-specific settings
+  random_forest:
+    n_estimators: 100
+    max_depth: 10
+    
+  deep_neural_network:
+    hidden_sizes: [128, 64, 32]
+    dropout: 0.2
+    learning_rate: 0.001
+    
+  gnn:
+    model_type: 'gcn'  # 'gcn', 'gat', 'mpnn'
+    hidden_dim: 64
+    num_layers: 3
+
+# Molecule Generation
+generation:
+  vae:
+    latent_dim: 128
+    hidden_dim: 256
+    max_length: 128
+    beta: 1.0
+    
+  genetic_algorithm:
+    population_size: 100
+    generations: 50
+    mutation_rate: 0.1
+    
+  fragment_based:
+    max_fragments_per_molecule: 4
+
+# Visualization
+visualization:
+  color_scheme: spectrum
+  size:
+  - 800
+  - 600
+  style: cartoon
+  
+  pymol:
+    ray_trace: false
+    quality: 'medium'
+    
+  plotly:
+    theme: 'plotly_white'
+    interactive: true
+
+# Optimization Pipeline
+optimization:
+  max_iterations: 20
+  convergence_threshold: 0.1
+  molecules_per_iteration: 100
+  top_n_selection: 20
+  diversity_weight: 0.3
+
+# Performance Settings
+performance:
+  parallel_processing: true
+  max_workers: 4
+  memory_limit: '8GB'
+
+# Dataset Generation & Fine-Tuning
+dataset:
+  # Data sources
+  source: 'chembl'  # chembl, zinc, pubchem
+  total_molecules: 60000
+  
+  # Output settings
+  output_dir: 'drug_dataset'
+  generate_2d_images: true
+  generate_3d_conformers: true
+  image_size: [300, 300]
+  
+  # Filtering criteria for drug-like molecules
+  filter_drug_like: true
+  min_mw: 150.0  # Minimum molecular weight
+  max_mw: 800.0  # Maximum molecular weight  
+  min_logp: -3.0 # Minimum LogP (lipophilicity)
+  max_logp: 8.0  # Maximum LogP
+  
+  # Performance settings
+  batch_size: 1000
+  delay_between_requests: 0.1
+  
+  # Fine-tuning data preparation
+  fine_tuning:
+    output_dir: 'fine_tuning_data'
+    prepare_vision: true      # For ViT, ResNet, EfficientNet
+    prepare_multimodal: true  # For CLIP, BLIP
+    prepare_graph: true       # For GNNs (GCN, GAT, GraphSAINT)
+    
+    # Vision model settings
+    image_size: 224           # Standard for most vision models
+    augmentation_strength: 'medium'  # light, medium, strong
+    
+    # Training settings (optimized for RTX 4060)
+    batch_size: 32            # Optimal for RTX 4060 memory
+    num_workers: 4            # Good for i7 14th gen
+    device: 'auto'            # auto, cpu, cuda
+    
+    # Property targets for supervised learning
+    property_targets:
+      - 'molecular_weight'
+      - 'logp'
+      - 'hba'              # Hydrogen bond acceptors
+      - 'hbd'              # Hydrogen bond donors  
+      - 'tpsa'             # Topological polar surface area

@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MADDIS - Multi-Agent Drug Discovery Platform</title>
+    <link rel="stylesheet" href="/static/styles.css">
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+</head>
+<body>
+    <div class="app-container">
+        <!-- Header -->
+        <header class="header">
+            <div class="logo">
+                <span class="logo-icon">🧬</span>
+                <h1>MADDIS</h1>
+                <span class="subtitle">Multi-Agent AI Drug Discovery</span>
+            </div>
+            <div class="header-status">
+                <span class="status-badge gemini" id="gemini-status">🤖 Gemini</span>
+                <span class="status-badge" id="agent-count">7 Agents</span>
+            </div>
+        </header>
+
+        <div class="main-layout">
+            <!-- Sidebar -->
+            <aside class="sidebar">
+                <div class="sidebar-section">
+                    <h3>📥 Molecule Input</h3>
+                    <div class="input-group">
+                        <select id="input-method">
+                            <option value="name">Drug Name</option>
+                            <option value="smiles">SMILES</option>
+                            <option value="database">Database</option>
+                        </select>
+                    </div>
+                    <div class="input-group" id="name-input-group">
+                        <input type="text" id="molecule-input" placeholder="e.g., Aspirin, Ibuprofen">
+                    </div>
+                    <div class="input-group hidden" id="database-select-group">
+                        <select id="database-select">
+                            <option value="">Select molecule...</option>
+                            <option value="aspirin">Aspirin</option>
+                            <option value="ibuprofen">Ibuprofen</option>
+                            <option value="acetaminophen">Acetaminophen</option>
+                            <option value="caffeine">Caffeine</option>
+                            <option value="penicillin">Penicillin</option>
+                            <option value="morphine">Morphine</option>
+                            <option value="metformin">Metformin</option>
+                            <option value="omeprazole">Omeprazole</option>
+                        </select>
+                    </div>
+                    <button class="btn primary" onclick="analyzeMolecule()">
+                        🔬 Analyze
+                    </button>
+                </div>
+
+                <div class="sidebar-section">
+                    <h3>🤖 Agent Status</h3>
+                    <div id="agent-status-list" class="agent-list">
+                        <!-- Filled by JS -->
+                    </div>
+                </div>
+            </aside>
+
+            <!-- Main Content -->
+            <main class="main-content">
+                <!-- Tab Navigation -->
+                <nav class="tab-nav">
+                    <button class="tab active" data-tab="basic">📊 Basic</button>
+                    <button class="tab" data-tab="multiagent">🤖 Multi-Agent</button>
+                    <button class="tab" data-tab="rl">🧬 RL Generation</button>
+                    <button class="tab" data-tab="multitarget">🎯 Multi-Target</button>
+                    <button class="tab" data-tab="chemspace">🔬 Chem Space</button>
+                    <button class="tab" data-tab="stability">⚗️ Stability</button>
+                    <button class="tab" data-tab="compatibility">💊 Compatibility</button>
+                </nav>
+
+                <!-- Tab Contents -->
+                <div class="tab-content active" id="tab-basic">
+                    <div class="welcome-card" id="welcome-screen">
+                        <h2>🧬 Welcome to MADDIS</h2>
+                        <p>Enter a molecule name or SMILES to begin analysis</p>
+                        <div class="quick-start">
+                            <span>Quick start:</span>
+                            <button class="chip" onclick="quickAnalyze('aspirin')">Aspirin</button>
+                            <button class="chip" onclick="quickAnalyze('ibuprofen')">Ibuprofen</button>
+                            <button class="chip" onclick="quickAnalyze('caffeine')">Caffeine</button>
+                        </div>
+                    </div>
+                    <div id="basic-results" class="hidden">
+                        <div class="results-grid">
+                            <div class="card molecule-card">
+                                <h3 id="molecule-name">Molecule</h3>
+                                <div id="molecule-3d" class="plot-container"></div>
+                                <code id="molecule-smiles" class="smiles-code"></code>
+                            </div>
+                            <div class="card properties-card">
+                                <h3>📋 Properties</h3>
+                                <div id="properties-list" class="properties-grid"></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="tab-content" id="tab-multiagent">
+                    <div class="card">
+                        <h3>🤖 Multi-Agent Drug Discovery Analysis</h3>
+                        <p>Orchestrate 7 specialized AI agents for comprehensive drug analysis.</p>
+                        <div class="form-row">
+                            <select id="target-protein">
+                                <option value="EGFR">EGFR</option>
+                                <option value="COX2">COX-2</option>
+                                <option value="ACE2">ACE2</option>
+                                <option value="BRAF">BRAF</option>
+                                <option value="CDK2">CDK2</option>
+                            </select>
+                            <button class="btn primary" onclick="runMultiAgent()">🚀 Run Analysis</button>
+                        </div>
+                        <div id="multiagent-results"></div>
+                    </div>
+                </div>
+
+                <div class="tab-content" id="tab-rl">
+                    <div class="card">
+                        <h3>🧬 RL Molecule Generation</h3>
+                        <p>Generate optimized molecular variants using Reinforcement Learning.</p>
+                        <div class="form-row">
+                            <div class="input-group">
+                                <label>Target Protein</label>
+                                <select id="rl-target">
+                                    <option value="EGFR">EGFR</option>
+                                    <option value="COX2">COX-2</option>
+                                    <option value="ACE2">ACE2</option>
+                                </select>
+                            </div>
+                            <div class="input-group">
+                                <label>Generations</label>
+                                <input type="number" id="rl-generations" value="20" min="5" max="100">
+                            </div>
+                            <div class="input-group">
+                                <label>Library Size</label>
+                                <input type="number" id="rl-library-size" value="10" min="5" max="50">
+                            </div>
+                        </div>
+                        <button class="btn primary" onclick="runRLGeneration()">🚀 Generate Molecules</button>
+                        <div id="rl-progress" class="hidden">
+                            <div class="progress-bar"><div class="progress-fill"></div></div>
+                            <span class="progress-text">Training...</span>
+                        </div>
+                        <div id="rl-results"></div>
+                    </div>
+                </div>
+
+                <div class="tab-content" id="tab-multitarget">
+                    <div class="card">
+                        <h3>🎯 Multi-Target RL Optimization</h3>
+                        <p>Optimize molecules against multiple protein targets simultaneously.</p>
+                        <div class="form-row">
+                            <div class="checkbox-group">
+                                <label><input type="checkbox" value="EGFR" checked> EGFR</label>
+                                <label><input type="checkbox" value="COX2" checked> COX-2</label>
+                                <label><input type="checkbox" value="ACE2"> ACE2</label>
+                                <label><input type="checkbox" value="BRAF"> BRAF</label>
+                                <label><input type="checkbox" value="CDK2"> CDK2</label>
+                            </div>
+                        </div>
+                        <button class="btn primary" onclick="runMultiTarget()">🚀 Optimize</button>
+                        <div id="multitarget-results"></div>
+                    </div>
+                </div>
+
+                <div class="tab-content" id="tab-chemspace">
+                    <div class="card">
+                        <h3>🔬 Chemical Space Analytics</h3>
+                        <p>Explore molecular fingerprints, clustering, and property correlations.</p>
+                        <button class="btn primary" onclick="runChemSpace()">📊 Analyze Chemical Space</button>
+                        <div id="chemspace-results"></div>
+                    </div>
+                </div>
+
+                <div class="tab-content" id="tab-stability">
+                    <div class="card">
+                        <h3>⚗️ Stability & ADMET Analysis</h3>
+                        <p>Predict absorption, distribution, metabolism, excretion, and toxicity.</p>
+                        <button class="btn primary" onclick="runStability()">🧪 Analyze Stability</button>
+                        <div id="stability-results"></div>
+                    </div>
+                </div>
+
+                <div class="tab-content" id="tab-compatibility">
+                    <div class="card">
+                        <h3>💊 Drug Compatibility Check</h3>
+                        <p>Analyze interactions between two drug molecules.</p>
+                        <div class="form-row">
+                            <div class="input-group">
+                                <label>Second Drug</label>
+                                <input type="text" id="second-drug" placeholder="e.g., Warfarin">
+                            </div>
+                            <button class="btn primary" onclick="runCompatibility()">🔍 Check Compatibility</button>
+                        </div>
+                        <div id="compatibility-results"></div>
+                    </div>
+                </div>
+            </main>
+
+            <!-- Chat Panel -->
+            <aside class="chat-panel">
+                <div class="chat-header">
+                    <h3>💬 Gemini AI Assistant</h3>
+                    <button class="btn-icon" onclick="toggleChat()">−</button>
+                </div>
+                <div class="chat-messages" id="chat-messages">
+                    <div class="message assistant">
+                        <span>🤖 Hello! Ask me anything about drug discovery, molecular properties, or ADMET.</span>
+                    </div>
+                </div>
+                <div class="chat-input">
+                    <input type="text" id="chat-input" placeholder="Ask a question..." onkeypress="handleChatKey(event)">
+                    <button class="btn primary" onclick="sendChat()">Send</button>
+                </div>
+                <div class="quick-questions">
+                    <button class="chip" onclick="quickChat('What is LogP?')">LogP?</button>
+                    <button class="chip" onclick="quickChat('Lipinski rules?')">Lipinski?</button>
+                    <button class="chip" onclick="quickChat('What is ADMET?')">ADMET?</button>
+                </div>
+            </aside>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

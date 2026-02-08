@@ -1,0 +1,54 @@
+# Unwanted folder
+unwanted/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+env/
+.venv/
+.venv_new/
+.env
+
+# PyTorch models & checkpoints
+*.pt
+*.pth
+*.ckpt
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Logs
+*.log
+mlruns/
+
+# Large data folders
+drug_dataset/
+drug_dataset_massive/
+max_accuracy_drug_model_final/
+chembl_100k.txt
+
+# Model files
+*.safetensors
+
+# Chat history
+chatbot/history/
+
+# Outputs
+outputs/
