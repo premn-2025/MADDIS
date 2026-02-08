@@ -11,8 +11,11 @@ import logging
 # Suppress all warnings before importing other libraries
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 warnings.filterwarnings('ignore')
-logging.getLogger('torch').setLevel(logging.ERROR)
-logging.getLogger('torch.classes').setLevel(logging.ERROR)
+try:
+    logging.getLogger('torch').setLevel(logging.ERROR)
+    logging.getLogger('torch.classes').setLevel(logging.ERROR)
+except Exception:
+    pass
 
 import streamlit as st
 import pandas as pd
@@ -22,31 +25,33 @@ import plotly.express as px
 from rdkit import Chem
 from rdkit.Chem import AllChem, Descriptors, Descriptors3D, Crippen
 from rdkit.Chem import rdMolDescriptors, rdDepictor
-import torch
-import torch.nn.functional as F
 import asyncio
 import json
 import time
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 
+# Optional torch import (heavy dependency, not needed for core UI)
+try:
+    import torch
+    import torch.nn.functional as F
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+    torch = None
+    F = None
+
 # Optional transformers import for AI model
 try:
-    import sys
-    # Increase recursion limit temporarily for peft import (version conflict workaround)
-    old_limit = sys.getrecursionlimit()
-    sys.setrecursionlimit(5000)
     from transformers import AutoTokenizer, AutoModelForSequenceClassification
     from peft import PeftModel, PeftConfig
-    sys.setrecursionlimit(old_limit)
     TRANSFORMERS_AVAILABLE = True
-except (ImportError, RecursionError, Exception):
+except ImportError:
     TRANSFORMERS_AVAILABLE = False
     AutoTokenizer = None
     AutoModelForSequenceClassification = None
     PeftModel = None
     PeftConfig = None
-    # Silent - no spam in logs
 
 warnings.filterwarnings('ignore')
 
@@ -113,20 +118,12 @@ try:
 except ImportError:
     CHEMICAL_ANALYTICS_AVAILABLE = False
 
-# Import section chat assistant - DISABLED: Using Copilot chat only
-# try:
-#     from section_chat_assistant import render_chat_expander
-#     CHAT_ASSISTANT_AVAILABLE = True
-# except ImportError:
-#     CHAT_ASSISTANT_AVAILABLE = False
-CHAT_ASSISTANT_AVAILABLE = False  # Only use Copilot sidebar chat
-
-# Import Copilot-style chat UI
+# Import section chat assistant
 try:
-    from chatbot.copilot_chat_ui import render_copilot_chat
-    COPILOT_CHAT_AVAILABLE = True
+    from section_chat_assistant import render_chat_expander
+    CHAT_ASSISTANT_AVAILABLE = True
 except ImportError:
-    COPILOT_CHAT_AVAILABLE = False
+    CHAT_ASSISTANT_AVAILABLE = False
 
 # Page configuration - must be first Streamlit command
 st.set_page_config(
@@ -155,49 +152,26 @@ st.markdown("""
 
 class UniversalMultiAgentPlatform:
     def __init__(self):
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        if TORCH_AVAILABLE:
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        else:
+            self.device = 'cpu'
         self.model = None
         self.tokenizer = None
         self.multiagent_orchestrator = None
         # Don't initialize multi-agent system at startup - do it lazily when needed
         
         self.known_molecules = {
-            # Common pain relievers
-            "aspirin": "CC(=O)Oc1ccccc1C(=O)O",
+            "aspirin": "CC(=O)OC1=CC=CC=C1C(=O)O",
             "ibuprofen": "CC(C)Cc1ccc(C(C)C(=O)O)cc1",
-            "paracetamol": "CC(=O)Nc1ccc(O)cc1",
-            "acetaminophen": "CC(=O)Nc1ccc(O)cc1",  # Same as paracetamol
-            "tylenol": "CC(=O)Nc1ccc(O)cc1",  # Brand name
-            "naproxen": "COc1ccc2cc(C(C)C(=O)O)ccc2c1",
-            "celecoxib": "Cc1ccc(-c2cc(C(F)(F)F)nn2-c2ccc(S(N)(=O)=O)cc2)cc1",
-            
-            # Stimulants
-            "caffeine": "Cn1cnc2c1c(=O)n(C)c(=O)n2C",
-            
-            # Antibiotics
-            "penicillin": "CC1(C)S[C@@H]2[C@H](NC(=O)Cc3ccccc3)C(=O)N2[C@H]1C(=O)O",
-            "amoxicillin": "CC1(C)S[C@@H]2[C@H](NC(=O)[C@H](N)c3ccc(O)cc3)C(=O)N2[C@H]1C(=O)O",
-            
-            # Diabetes
-            "metformin": "CN(C)C(=N)NC(=N)N",
-            
-            # Cardiovascular
-            "warfarin": "CC(=O)CC(c1ccccc1)c1c(O)c2ccccc2oc1=O",
-            "atorvastatin": "CC(C)c1c(C(=O)Nc2ccccc2)c(-c2ccc(F)cc2)c(-c2ccccc2)n1CC[C@@H](O)C[C@@H](O)CC(=O)O",
-            
-            # Opioids
-            "morphine": "CN1CC[C@]23c4c5ccc(O)c4O[C@H]2[C@@H](O)C=C[C@H]3[C@H]1C5",
-            
-            # Simple molecules
+            "paracetamol": "CC(=O)NC1=CC=C(C=C1)O",
+            "caffeine": "CN1C=NC2=C1C(=O)N(C(=O)N2C)C",
+            "morphine": "CN1CC[C@]23[C@@H]4[C@H]1CC5=C2C(=C(C=C5)O)O[C@H]3[C@H](C=C4)O",
+            "warfarin": "CC1=C(C2=C(C=C1)OC(=O)[C@@H]2C3=CC=C(C=C3)Cl)C",
+            "metformin": "CN(C)C(=N)N=C(N)N",
             "ethanol": "CCO",
-            "glucose": "OC[C@H]1OC(O)[C@H](O)[C@@H](O)[C@@H]1O",
-            "water": "O",
-            "benzene": "c1ccccc1",
-            "phenol": "Oc1ccccc1",
-            
-            # Kinase inhibitors (for demo)
-            "gefitinib": "COc1cc2ncnc(Nc3ccc(F)c(Cl)c3)c2cc1OCCCN1CCOCC1",
-            "erlotinib": "COCCOc1cc2ncnc(Nc3cccc(C#C)c3)c2cc1OCCOC",
+            "glucose": "C([C@@H]1[C@H]([C@@H]([C@H]([C@H](O1)O)O)O)O)O",
+            "penicillin": "CC1([C@@H](N2[C@H](S1)[C@@H](C2=O)NC(=O)CC3=CC=CC=C3)C(=O)O)C"
         }
 
     def initialize_multiagent_system(self):
@@ -219,8 +193,8 @@ class UniversalMultiAgentPlatform:
 
     def load_ai_model(self):
         """Load the trained AI model for drug interaction prediction"""
-        if not TRANSFORMERS_AVAILABLE:
-            st.warning(" Transformers library not available. AI predictions disabled.")
+        if not TRANSFORMERS_AVAILABLE or not TORCH_AVAILABLE:
+            st.warning("Transformers/PyTorch not available. AI predictions disabled.")
             return False
         try:
             model_paths = ["./max_accuracy_drug_model_final", "./ultra_drug_interaction_final"]
@@ -250,49 +224,12 @@ class UniversalMultiAgentPlatform:
             mol = Chem.MolFromSmiles(smiles)
             if mol:
                 return mol, smiles, input_lower.title()
-        
         # Try as SMILES (case-sensitive - SMILES uses case for chirality)
         mol = Chem.MolFromSmiles(input_text)
         if mol:
             canonical_smiles = Chem.MolToSmiles(mol)
             return mol, canonical_smiles, "Custom Molecule"
-        
-        # If not SMILES, try PubChem API lookup
-        try:
-            smiles, name = self._lookup_pubchem(input_text)
-            if smiles:
-                mol = Chem.MolFromSmiles(smiles)
-                if mol:
-                    # Cache for future use
-                    self.known_molecules[input_lower] = smiles
-                    return mol, smiles, name
-        except Exception as e:
-            st.warning(f"PubChem lookup failed: {e}")
-        
         return None, None, None
-    
-    def _lookup_pubchem(self, drug_name):
-        """Lookup drug name in PubChem to get SMILES"""
-        import requests
-        
-        try:
-            # PubChem API endpoint
-            url = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{drug_name}/property/CanonicalSMILES,Title/JSON"
-            response = requests.get(url, timeout=10)
-            
-            if response.status_code == 200:
-                data = response.json()
-                props = data['PropertyTable']['Properties'][0]
-                smiles = props.get('CanonicalSMILES')
-                name = props.get('Title', drug_name.title())
-                st.success(f"✅ Found '{name}' in PubChem!")
-                return smiles, name
-            else:
-                st.warning(f"Drug '{drug_name}' not found in PubChem. Try entering SMILES directly.")
-                return None, None
-        except Exception as e:
-            st.warning(f"Could not connect to PubChem: {e}")
-            return None, None
 
     def generate_3d_structure(self, mol):
         """Generate 3D coordinates for a molecule"""
@@ -334,13 +271,12 @@ class UniversalMultiAgentPlatform:
                 AllChem.EmbedMolecule(mol_3d, randomSeed=42)
                 if mol_3d.GetNumConformers() == 0:
                     AllChem.Compute2DCoords(mol_3d)
-                    # Add fake Z coordinates
-            
+
             conf = mol_3d.GetConformer(0)
         except Exception as e:
             st.error(f"Cannot get conformer: {e}")
             return go.Figure()
-        
+
         atoms, x, y, z, colors, sizes = [], [], [], [], [], []
         color_map = {'C': '#909090', 'N': '#3050F8', 'O': '#FF0D0D', 'H': '#FFFFFF', 'S': '#FFFF30', 'F': '#90E050', 'Cl': '#1FF01F', 'Br': '#A62929', 'P': '#FF8000', 'I': '#940094'}
         size_map = {'C': 8, 'N': 8, 'O': 7, 'H': 4, 'S': 9, 'F': 6, 'Cl': 8, 'Br': 9, 'P': 9, 'I': 10}
@@ -363,26 +299,10 @@ class UniversalMultiAgentPlatform:
             bonds_y.extend([start_pos.y, end_pos.y, None])
             bonds_z.extend([start_pos.z, end_pos.z, None])
 
-        # Create figure without template to avoid Plotly deepcopy recursion bug
-        import plotly.io as pio
-        pio.templates.default = None  # Disable template
-        
-        fig = go.Figure(
-            data=[
-                go.Scatter3d(x=bonds_x, y=bonds_y, z=bonds_z, mode='lines', 
-                           line=dict(color='gray', width=4), hoverinfo='skip', name='Bonds'),
-                go.Scatter3d(x=x, y=y, z=z, mode='markers', 
-                           marker=dict(size=sizes, color=colors, line=dict(width=1, color='black')), 
-                           text=atoms, name='Atoms', hovertemplate='%{text}<extra></extra>')
-            ],
-            layout=go.Layout(
-                title=title, 
-                scene=dict(xaxis_title="X", yaxis_title="Y", zaxis_title="Z", bgcolor='rgba(240,240,240,0.9)'), 
-                height=500, 
-                showlegend=False,
-                template=None  # Explicitly no template
-            )
-        )
+        fig = go.Figure()
+        fig.add_trace(go.Scatter3d(x=bonds_x, y=bonds_y, z=bonds_z, mode='lines', line=dict(color='gray', width=4), hoverinfo='skip', name='Bonds'))
+        fig.add_trace(go.Scatter3d(x=x, y=y, z=z, mode='markers', marker=dict(size=sizes, color=colors, line=dict(width=1, color='black')), text=atoms, name='Atoms', hovertemplate='%{text}<extra></extra>'))
+        fig.update_layout(title=title, scene=dict(xaxis_title="X", yaxis_title="Y", zaxis_title="Z", bgcolor='rgba(240,240,240,0.9)'), height=500, showlegend=False)
         return fig
 
     def calculate_molecular_properties(self, mol):
@@ -514,9 +434,9 @@ class UniversalMultiAgentPlatform:
             st.markdown('<div class="agent-card"><h4>⚗️ Synthesis Planner</h4><p>• Retrosynthesis<br>• Route planning</p></div>', unsafe_allow_html=True)
 
     def run_drug_interaction_checker(self):
-        """Drug-Drug Interaction Analysis - Enhanced Version"""
+        """Drug-Drug Interaction Analysis"""
         st.subheader("💊 Drug-Drug Interaction Checker")
-        st.markdown("Analyze potential interactions between two drugs and assess combination safety")
+        st.markdown("Analyze potential interactions between two drugs")
         
         # Add chat assistant for this section
         if CHAT_ASSISTANT_AVAILABLE:
@@ -524,209 +444,33 @@ class UniversalMultiAgentPlatform:
         
         col1, col2 = st.columns(2)
         with col1:
-            drug_a = st.text_input("Enter Drug A:", placeholder="e.g., aspirin, acetaminophen", key="drug_a_input")
+            drug_a = st.text_input("Enter Drug A:", placeholder="e.g., aspirin")
         with col2:
-            drug_b = st.text_input("Enter Drug B:", placeholder="e.g., ibuprofen, caffeine", key="drug_b_input")
+            drug_b = st.text_input("Enter Drug B:", placeholder="e.g., warfarin")
         
-        if st.button("🔍 Analyze Drug Interaction", type="primary"):
+        if st.button("🔍 Check Interaction", type="primary"):
             if drug_a and drug_b:
-                with st.spinner("Analyzing drug interaction..."):
-                    self._analyze_drug_interaction(drug_a, drug_b)
+                # Known dangerous interactions
+                dangerous_pairs = {
+                    ("aspirin", "warfarin"): {"risk": "HIGH", "warning": "Increased bleeding risk - BLACK BOX WARNING"},
+                    ("warfarin", "aspirin"): {"risk": "HIGH", "warning": "Increased bleeding risk - BLACK BOX WARNING"},
+                    ("aspirin", "ibuprofen"): {"risk": "MODERATE", "warning": "GI bleeding risk, reduced cardioprotection"},
+                    ("ibuprofen", "aspirin"): {"risk": "MODERATE", "warning": "GI bleeding risk, reduced cardioprotection"},
+                    ("metformin", "alcohol"): {"risk": "HIGH", "warning": "Lactic acidosis risk"},
+                }
+                
+                key = (drug_a.lower(), drug_b.lower())
+                if key in dangerous_pairs:
+                    info = dangerous_pairs[key]
+                    if info["risk"] == "HIGH":
+                        st.error(f"🚫 **HIGH RISK**: {info['warning']}")
+                    else:
+                        st.warning(f"⚠️ **{info['risk']} RISK**: {info['warning']}")
+                else:
+                    st.success(f"✅ No major interaction found between {drug_a} and {drug_b}")
+                    st.info("Note: Always consult a healthcare provider for medical advice")
             else:
                 st.warning("Please enter both drug names")
-    
-    def _analyze_drug_interaction(self, drug_a: str, drug_b: str):
-        """Comprehensive drug interaction analysis"""
-        # Get molecules
-        mol_a, smiles_a, name_a = self.get_molecule_from_name_or_smiles(drug_a)
-        mol_b, smiles_b, name_b = self.get_molecule_from_name_or_smiles(drug_b)
-        
-        if not mol_a:
-            st.error(f"❌ Could not find drug: {drug_a}")
-            return
-        if not mol_b:
-            st.error(f"❌ Could not find drug: {drug_b}")
-            return
-        
-        st.success(f"✅ Found both drugs: **{name_a}** + **{name_b}**")
-        
-        # Show individual drug structures
-        st.markdown("### 🧬 Drug Structures")
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown(f"**{name_a}**")
-            st.code(smiles_a, language="text")
-            props_a = self.calculate_molecular_properties(mol_a)
-            st.write(f"MW: {props_a.get('Molecular Weight', 'N/A')}")
-            st.write(f"LogP: {props_a.get('LogP', 'N/A')}")
-        with col2:
-            st.markdown(f"**{name_b}**")
-            st.code(smiles_b, language="text")
-            props_b = self.calculate_molecular_properties(mol_b)
-            st.write(f"MW: {props_b.get('Molecular Weight', 'N/A')}")
-            st.write(f"LogP: {props_b.get('LogP', 'N/A')}")
-        
-        st.markdown("---")
-        
-        # Known dangerous interactions
-        st.markdown("### ⚠️ Known Interaction Database")
-        dangerous_pairs = {
-            ("aspirin", "warfarin"): {"risk": "HIGH", "type": "Bleeding", "warning": "Increased bleeding risk - Both affect blood clotting"},
-            ("aspirin", "ibuprofen"): {"risk": "MODERATE", "type": "GI/Cardiac", "warning": "GI bleeding risk, ibuprofen may reduce aspirin's cardioprotection"},
-            ("warfarin", "ibuprofen"): {"risk": "HIGH", "type": "Bleeding", "warning": "NSAIDs increase bleeding risk with warfarin"},
-            ("metformin", "alcohol"): {"risk": "HIGH", "type": "Metabolic", "warning": "Risk of lactic acidosis"},
-            ("acetaminophen", "alcohol"): {"risk": "HIGH", "type": "Hepatic", "warning": "Liver damage risk - both metabolized by liver"},
-            ("caffeine", "ephedrine"): {"risk": "HIGH", "type": "Cardiac", "warning": "Dangerous cardiovascular stimulation"},
-        }
-        
-        # Check both orderings
-        key1 = (drug_a.lower(), drug_b.lower())
-        key2 = (drug_b.lower(), drug_a.lower())
-        known_interaction = dangerous_pairs.get(key1) or dangerous_pairs.get(key2)
-        
-        if known_interaction:
-            risk = known_interaction["risk"]
-            if risk == "HIGH":
-                st.error(f"🚫 **HIGH RISK INTERACTION DETECTED**")
-                st.error(f"Type: {known_interaction['type']}")
-                st.error(f"Warning: {known_interaction['warning']}")
-            else:
-                st.warning(f"⚠️ **{risk} RISK INTERACTION**")
-                st.warning(f"Type: {known_interaction['type']}")
-                st.warning(f"Warning: {known_interaction['warning']}")
-        else:
-            st.info("ℹ️ No known dangerous interaction in database")
-        
-        st.markdown("---")
-        
-        # Molecular similarity and structural analysis
-        st.markdown("### 🔬 Structural Analysis")
-        from rdkit.Chem import rdFingerprintGenerator
-        from rdkit import DataStructs
-        
-        mfpgen = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
-        fp_a = mfpgen.GetFingerprint(mol_a)
-        fp_b = mfpgen.GetFingerprint(mol_b)
-        similarity = DataStructs.TanimotoSimilarity(fp_a, fp_b)
-        
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Structural Similarity", f"{similarity:.1%}")
-        
-        # Analyze functional group overlap using SMARTS patterns (more compatible)
-        try:
-            # SMARTS patterns for common functional groups
-            acid_pattern = Chem.MolFromSmarts('[CX3](=O)[OX2H1]')  # Carboxylic acid
-            ester_pattern = Chem.MolFromSmarts('[CX3](=O)[OX2][#6]')  # Ester
-            phenol_pattern = Chem.MolFromSmarts('[OX2H][c]')  # Phenol
-            
-            acid_a = len(mol_a.GetSubstructMatches(acid_pattern)) + len(mol_a.GetSubstructMatches(ester_pattern))
-            acid_b = len(mol_b.GetSubstructMatches(acid_pattern)) + len(mol_b.GetSubstructMatches(ester_pattern))
-            phenol_a = len(mol_a.GetSubstructMatches(phenol_pattern))
-            phenol_b = len(mol_b.GetSubstructMatches(phenol_pattern))
-        except:
-            acid_a = acid_b = phenol_a = phenol_b = 0
-        
-        functional_overlap = (acid_a > 0 and acid_b > 0) or (phenol_a > 0 and phenol_b > 0)
-        col2.metric("Functional Overlap", "Yes ⚠️" if functional_overlap else "No ✅")
-        
-        # Combined molecular weight
-        mw_a = float(props_a.get('Molecular Weight', 0))
-        mw_b = float(props_b.get('Molecular Weight', 0))
-        combined_mw = mw_a + mw_b
-        col3.metric("Combined MW", f"{combined_mw:.1f}")
-        
-        st.markdown("---")
-        
-        # Safety Assessment
-        st.markdown("### 🛡️ Combination Safety Assessment")
-        
-        safety_issues = []
-        safety_score = 100
-        
-        # Check combined LogP (lipophilicity)
-        logp_a = float(props_a.get('LogP', 0))
-        logp_b = float(props_b.get('LogP', 0))
-        if logp_a > 5 or logp_b > 5:
-            safety_issues.append("⚠️ High lipophilicity may cause accumulation")
-            safety_score -= 15
-        
-        # Check if both are highly similar (may compete for metabolism)
-        if similarity > 0.7:
-            safety_issues.append("⚠️ High structural similarity - may compete for same metabolic pathways")
-            safety_score -= 20
-        
-        # Check functional group overlap
-        if functional_overlap:
-            safety_issues.append("⚠️ Similar functional groups - potential pharmacokinetic interaction")
-            safety_score -= 10
-        
-        # Check known interaction
-        if known_interaction:
-            if known_interaction["risk"] == "HIGH":
-                safety_score -= 50
-            else:
-                safety_score -= 25
-        
-        # Check combined MW for bioavailability
-        if combined_mw > 900:
-            safety_issues.append("⚠️ High combined molecular weight")
-            safety_score -= 5
-        
-        # Display safety score
-        safety_score = max(0, safety_score)
-        
-        if safety_score >= 80:
-            st.success(f"✅ **Safety Score: {safety_score}/100** - Combination appears SAFE")
-            verdict = "SAFE"
-            color = "green"
-        elif safety_score >= 50:
-            st.warning(f"⚠️ **Safety Score: {safety_score}/100** - USE WITH CAUTION")
-            verdict = "CAUTION"
-            color = "orange"
-        else:
-            st.error(f"🚫 **Safety Score: {safety_score}/100** - NOT RECOMMENDED")
-            verdict = "AVOID"
-            color = "red"
-        
-        # Show issues
-        if safety_issues:
-            st.markdown("**Issues Found:**")
-            for issue in safety_issues:
-                st.write(issue)
-        
-        st.markdown("---")
-        
-        # Practical Combination Assessment
-        st.markdown("### 💊 Practical Combination Assessment")
-        
-        practical_data = {
-            "Factor": ["Structural Compatibility", "Metabolic Pathway Risk", "Pharmacokinetic Interaction", "Known Clinical Data", "Overall Recommendation"],
-            "Status": [
-                "Compatible ✅" if similarity < 0.5 else "Similar ⚠️",
-                "Low Risk ✅" if not functional_overlap else "Potential Risk ⚠️",
-                "Minimal ✅" if similarity < 0.3 else "Possible ⚠️",
-                "Interaction Found 🚫" if known_interaction else "No Data ℹ️",
-                f":{color}[{verdict}]"
-            ],
-            "Notes": [
-                f"{similarity:.1%} similarity",
-                "Based on functional group analysis",
-                "Based on structural fingerprints",
-                known_interaction['warning'] if known_interaction else "Consult healthcare provider",
-                f"Safety score: {safety_score}/100"
-            ]
-        }
-        
-        st.dataframe(pd.DataFrame(practical_data), use_container_width=True)
-        
-        # Final recommendation
-        st.markdown("### 📋 Summary")
-        if verdict == "SAFE":
-            st.success(f"**{name_a} + {name_b}**: This combination appears to be safe for concurrent use based on structural and database analysis. Always consult a healthcare provider for personalized advice.")
-        elif verdict == "CAUTION":
-            st.warning(f"**{name_a} + {name_b}**: Use this combination with caution. Monitor for adverse effects and consult a healthcare provider.")
-        else:
-            st.error(f"**{name_a} + {name_b}**: This combination is NOT recommended due to significant interaction risk. Seek alternative medications.")
 
     def run_admet_prediction(self, mol, smiles, name):
         """ADMET Property Prediction"""
@@ -797,14 +541,10 @@ class UniversalMultiAgentPlatform:
         st.subheader("⚗️ Synthesis Route Planning")
         
         try:
-            from rdkit.Chem import rdMolDescriptors, Descriptors
+            from rdkit.Chem import rdMolDescriptors
             
-            # Calculate complexity - use Descriptors.BertzCT (not rdMolDescriptors.CalcBertzCT)
-            try:
-                complexity = Descriptors.BertzCT(mol)
-            except:
-                # Fallback: estimate from atom count
-                complexity = mol.GetNumHeavyAtoms() * 10
+            # Calculate complexity
+            complexity = rdMolDescriptors.CalcBertzCT(mol)
             num_rings = rdMolDescriptors.CalcNumRings(mol)
             num_stereo = len(Chem.FindMolChiralCenters(mol))
             
@@ -872,6 +612,10 @@ class UniversalMultiAgentPlatform:
         standalone_modes = ["Drug Interaction Checker", "RL Molecule Generation", "Multi-Target RL", "Chemical Space Analytics"]
         
         if analysis_mode in standalone_modes:
+            # Clear any previous molecule input from session state
+            if 'molecule_input' in st.session_state:
+                del st.session_state['molecule_input']
+            
             st.sidebar.markdown("---")
             st.sidebar.success(f"📌 Mode: {analysis_mode}")
             
@@ -946,6 +690,23 @@ class UniversalMultiAgentPlatform:
         if CHAT_ASSISTANT_AVAILABLE:
             render_chat_expander("rl_generation", key_suffix="_rl")
         
+        # --- Drug / Disease input ---
+        st.markdown("### 💊 What drug are you designing?")
+        drug_col1, drug_col2 = st.columns(2)
+        with drug_col1:
+            drug_name = st.text_input(
+                "Drug / Disease name:",
+                placeholder="e.g., Anti-cancer EGFR inhibitor, Alzheimer’s drug, Aspirin analog",
+                key="rl_drug_name"
+            )
+        with drug_col2:
+            reference_smiles = st.text_input(
+                "Reference molecule SMILES (optional):",
+                placeholder="e.g., CC(=O)OC1=CC=CC=C1C(=O)O",
+                key="rl_reference_smiles"
+            )
+        
+        st.markdown("### ⚙️ Generation Settings")
         col1, col2 = st.columns(2)
         with col1:
             target_property = st.selectbox("Optimization Target:", [
@@ -961,7 +722,16 @@ class UniversalMultiAgentPlatform:
             target_protein = st.selectbox("Target Protein (for docking):", ["EGFR", "COX2", "BACE1", "JAK2", "THROMBIN"])
             seed_smiles = st.text_input("Seed molecule (optional):", placeholder="CC(=O)OC1=CC=CC=C1C(=O)O")
         
+        # Use reference SMILES as seed if provided and seed is empty
+        if reference_smiles and not seed_smiles:
+            seed_smiles = reference_smiles
+        
         if st.button("🚀 Generate Molecules", type="primary"):
+            if not drug_name:
+                st.warning("⚠️ Please enter a drug or disease name so the generator knows what to optimize for.")
+                return
+            
+            st.info(f"🎯 Designing **{drug_name}** candidates targeting **{target_protein}** optimized for **{target_property}**")
             with st.spinner("Generating molecules with RL..."):
                 # Generate molecules
                 generated = self.generate_rl_molecules(target_property, num_molecules, seed_smiles)
@@ -1051,7 +821,23 @@ class UniversalMultiAgentPlatform:
         if CHAT_ASSISTANT_AVAILABLE:
             render_chat_expander("multitarget_rl", key_suffix="_multitarget")
         
-        st.markdown("### Select Targets")
+        # --- Drug / Disease input ---
+        st.markdown("### 💊 What drug are you designing?")
+        mt_col1, mt_col2 = st.columns(2)
+        with mt_col1:
+            mt_drug_name = st.text_input(
+                "Drug / Disease name:",
+                placeholder="e.g., Multi-kinase cancer inhibitor, Dual COX/LOX inhibitor",
+                key="mt_drug_name"
+            )
+        with mt_col2:
+            mt_reference_smiles = st.text_input(
+                "Reference molecule SMILES (optional):",
+                placeholder="e.g., CC(=O)OC1=CC=CC=C1C(=O)O",
+                key="mt_reference_smiles"
+            )
+        
+        st.markdown("### 🎯 Select Targets")
         col1, col2, col3 = st.columns(3)
         
         with col1:
@@ -1082,6 +868,13 @@ class UniversalMultiAgentPlatform:
             if not targets:
                 st.error("Please select at least one target!")
                 return
+            
+            if not mt_drug_name:
+                st.warning("⚠️ Please enter a drug or disease name so the optimizer knows what to design.")
+                return
+            
+            target_names = ', '.join(t[0] for t in targets)
+            st.info(f"🎯 Designing **{mt_drug_name}** candidates targeting **{target_names}**")
             
             progress_bar = st.progress(0)
             status_text = st.empty()
@@ -1139,60 +932,6 @@ class UniversalMultiAgentPlatform:
                     title="Pareto Front of Optimized Molecules"
                 )
                 st.plotly_chart(fig, use_container_width=True)
-                
-                # Store results in session state for 3D visualization
-                st.session_state.multitarget_results = top_results
-                
-                # 3D Structure Visualization Section
-                st.markdown("### 🧬 3D Molecular Structure Visualization")
-                st.markdown("Select a molecule to view its 3D structure")
-                
-                # Create molecule selection options
-                mol_options = [f"Molecule {i+1}: Score {r.get('multi_target_score', 0):.3f} | QED {r['qed']:.3f}" 
-                              for i, r in enumerate(top_results)]
-                
-                selected_mol_idx = st.selectbox(
-                    "Select Molecule:",
-                    range(len(top_results)),
-                    format_func=lambda x: mol_options[x],
-                    key="multitarget_mol_select"
-                )
-                
-                # Display selected molecule's 3D structure
-                if selected_mol_idx is not None:
-                    selected_result = top_results[selected_mol_idx]
-                    selected_smiles = selected_result['smiles']
-                    
-                    col1, col2 = st.columns([2, 1])
-                    
-                    with col1:
-                        try:
-                            mol = Chem.MolFromSmiles(selected_smiles)
-                            if mol:
-                                mol_3d = self.generate_3d_structure(mol)
-                                fig_3d = self.create_3d_plot(mol_3d, title=f"3D Structure - Molecule {selected_mol_idx + 1}")
-                                st.plotly_chart(fig_3d, use_container_width=True)
-                            else:
-                                st.error("Could not parse molecule SMILES")
-                        except Exception as e:
-                            st.error(f"3D generation failed: {e}")
-                    
-                    with col2:
-                        st.markdown("#### Molecule Details")
-                        st.code(selected_smiles, language="text")
-                        st.metric("Multi-Target Score", f"{selected_result.get('multi_target_score', 0):.4f}")
-                        st.metric("QED Score", f"{selected_result['qed']:.4f}")
-                        st.metric("LogP", f"{selected_result['logp']:.2f}")
-                        st.metric("Molecular Weight", f"{selected_result['mw']:.1f} Da")
-                        
-                        # Calculate additional properties
-                        if mol:
-                            props = self.calculate_molecular_properties(mol)
-                            st.metric("H-Bond Donors", props.get('H-Bond Donors', 'N/A'))
-                            st.metric("H-Bond Acceptors", props.get('H-Bond Acceptors', 'N/A'))
-                            st.metric("Rotatable Bonds", props.get('Rotatable Bonds', 'N/A'))
-                            lipinski_status = "✅ Pass" if props.get('Drug-like', False) else "❌ Fail"
-                            st.metric("Lipinski's Rule", lipinski_status)
 
     def run_chemical_space_analytics(self):
         """Chemical Space Analytics Interface"""
@@ -1476,7 +1215,3 @@ if __name__ == "__main__":
         st.session_state.status_shown = True
     
     st.session_state.platform.run()
-    
-    # Render Copilot-style AI Chat
-    if COPILOT_CHAT_AVAILABLE:
-        render_copilot_chat()
