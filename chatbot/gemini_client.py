@@ -46,8 +46,9 @@ class GeminiClient:
         self.top_p = 0.8  # Focused token selection
         self.top_k = 20  # Limited vocabulary for precision
         
-        # Circuit Breaker - reduced to prevent long blocking
-        self.circuit_cooldown = 10  # 10 seconds, not 5 minutes
+        # Free-tier rate limiting (Gemini free tier: ~15 RPM)
+        self._last_call_time = 0.0
+        self._min_call_interval = 4.0  # seconds between API calls (safe for free tier)
         
         # Content-based request deduplication
         # Cache the last response; return it for identical repeat messages
@@ -177,7 +178,8 @@ class GeminiClient:
         if self.config.model_provider == 'ollama':
             return self._generate_with_ollama_primary(user_message, system_prompt, context)
         
-        # Default: Use Gemini (with optional Ollama fallback for hybrid mode)
+        # Default: Use Gemini (provider=gemini or hybrid)
+        # For 'gemini' and 'hybrid', use Gemini primary with Groq fallback
         return self._generate_with_gemini(user_message, system_prompt, context, include_history)
     
     def _generate_with_groq_primary(
@@ -252,21 +254,38 @@ class GeminiClient:
         # Generate with retry (max 2 attempts for speed)
         response_text = self._generate_with_retry(prompt, max_retries=2)
         
-        # If API failed (returned empty), try Ollama fallback for hybrid mode
+        # If API failed (returned empty), try Groq fallback, then Ollama
         if not response_text or response_text.strip() == "":
-            if self.config.model_provider == 'hybrid' and self.ollama_client and self.ollama_client.is_available:
-                logger.info("Gemini returned empty - trying Ollama fallback")
+            # Try Groq fallback first (fast and reliable)
+            if self.groq_client and self.groq_client.is_available:
+                logger.info("Gemini returned empty - trying Groq fallback")
                 try:
-                    response_text = self.ollama_client.generate_response(
+                    response_text = self.groq_client.generate_response(
                         user_message=user_message,
                         system_prompt=system_prompt,
                         context=context
                     )
                     if response_text and not response_text.startswith("⚠️"):
-                        logger.info("✅ Ollama fallback successful")
+                        logger.info("✅ Groq fallback successful")
                 except Exception as e:
-                    logger.warning(f"Ollama fallback failed: {e}")
+                    logger.warning(f"Groq fallback failed: {e}")
                     response_text = ""
+            
+            # Then try Ollama fallback for hybrid mode
+            if (not response_text or response_text.strip() == "") and self.config.model_provider == 'hybrid':
+                if self.ollama_client and self.ollama_client.is_available:
+                    logger.info("Trying Ollama fallback")
+                    try:
+                        response_text = self.ollama_client.generate_response(
+                            user_message=user_message,
+                            system_prompt=system_prompt,
+                            context=context
+                        )
+                        if response_text and not response_text.startswith("⚠️"):
+                            logger.info("✅ Ollama fallback successful")
+                    except Exception as e:
+                        logger.warning(f"Ollama fallback failed: {e}")
+                        response_text = ""
             
             # Final fallback to hardcoded responses
             if not response_text or response_text.strip() == "":
@@ -356,14 +375,19 @@ class GeminiClient:
         return '\n'.join(essential_lines)
     
     def _generate_with_retry(self, prompt: str, max_retries: int = 3) -> str:
-        """Generate response with exponential backoff retry and explicit sleep on 429"""
+        """Generate response with free-tier-friendly rate limiting and retry"""
         import time
-        import random
         
-        base_delay = 2  # seconds
+        # Free-tier throttle: wait if we called too recently
+        elapsed = time.time() - self._last_call_time
+        if elapsed < self._min_call_interval:
+            wait = self._min_call_interval - elapsed
+            logger.debug(f"Free-tier throttle: sleeping {wait:.1f}s")
+            time.sleep(wait)
         
         for attempt in range(max_retries):
             try:
+                self._last_call_time = time.time()
                 response = self.model.generate_content(prompt)
                 
                 if response.text:
@@ -373,19 +397,22 @@ class GeminiClient:
                 logger.warning(f"API request failed (attempt {attempt+1}/{max_retries}): {e}")
                 error_str = str(e).lower()
                 
-                # Detect rate limit 
-                if any(keyword in error_str for keyword in ['quota', 'rate', 'limit', '429', 'resource_exhausted']):
-                    # Don't block for 5 minutes - return empty immediately and use fallback
-                    logger.warning(f"Rate limit hit! Returning empty to trigger fallback.")
-                    return "" 
-                    
-                else:
-                    # For non-rate-limit errors (like 500s), also retry briefly
+                # Detect rate limit
+                if any(kw in error_str for kw in ['quota', 'rate', 'limit', '429', 'resource_exhausted']):
                     if attempt < max_retries - 1:
-                        time.sleep(1)
+                        # Exponential back-off: 10s, 30s
+                        wait = 10 * (attempt + 1)
+                        logger.warning(f"Rate limit hit. Waiting {wait}s before retry...")
+                        time.sleep(wait)
+                        continue
+                    else:
+                        logger.warning("Rate limit persists. Falling back.")
+                        return ""
+                else:
+                    if attempt < max_retries - 1:
+                        time.sleep(2)
                         continue
         
-        # Return empty to trigger fallback response
         return ""
     
     def _format_history(self, limit: int = 3) -> str:

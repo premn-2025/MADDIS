@@ -1472,19 +1472,43 @@ class UniversalMultiAgentPlatform:
                 st.warning("⚠️ Poor drug-likeness - consider optimization")
         
         with tabs[2]:
-            if GEMINI3_AVAILABLE:
-                st.subheader("🧠 Gemini 3 AI Analysis")
-                if st.button("🤖 Get AI Research Insights", type="primary"):
-                    with st.spinner("Consulting Gemini 3..."):
-                        try:
-                            orchestrator = LocalGemini3Orchestrator()
-                            plan = asyncio.run(orchestrator.plan_drug_discovery_campaign(f"Analyze drug candidate: {name} with SMILES: {smiles}"))
-                            st.write(plan.strategy if hasattr(plan, 'strategy') else str(plan))
-                        except Exception as e:
+            st.subheader("🧠 Gemini 3 AI Analysis")
+            st.markdown("Get AI-powered research insights for this molecule")
+            if st.button("🤖 Get AI Research Insights", type="primary"):
+                with st.spinner("Consulting Gemini 3 Flash Preview..."):
+                    try:
+                        import google.generativeai as genai
+                        api_key = os.environ.get('GEMINI_API_KEY', '')
+                        if not api_key or not api_key.startswith('AIza'):
+                            st.error("GEMINI_API_KEY not set. Add it to your `.env` file.")
+                        else:
+                            genai.configure(api_key=api_key)
+                            model_name = os.environ.get('GEMINI_MODEL', 'gemini-3-flash-preview')
+                            model = genai.GenerativeModel(model_name, generation_config={
+                                "temperature": 0.3, "max_output_tokens": 1024
+                            })
+                            # Free-tier throttle
+                            time.sleep(4)
+                            prompt = (
+                                f"You are a senior medicinal chemist. Analyze this drug candidate thoroughly.\n"
+                                f"Molecule: {name}\nSMILES: {smiles}\n"
+                                f"MW: {Descriptors.MolWt(mol):.1f}, LogP: {Descriptors.MolLogP(mol):.2f}, "
+                                f"QED: {Descriptors.qed(mol):.3f}, TPSA: {Descriptors.TPSA(mol):.1f}\n\n"
+                                f"Provide:\n1. Drug-likeness assessment\n2. Likely therapeutic area\n"
+                                f"3. ADMET concerns\n4. Structural optimization suggestions\n"
+                                f"5. Similar approved drugs\n\nBe concise and scientific."
+                            )
+                            resp = model.generate_content(prompt)
+                            if resp and resp.text:
+                                st.markdown(resp.text)
+                            else:
+                                st.warning("Gemini returned an empty response. You may have hit the free-tier rate limit — wait a minute and try again.")
+                    except Exception as e:
+                        err = str(e).lower()
+                        if any(kw in err for kw in ['quota', 'rate', '429', 'resource_exhausted']):
+                            st.warning("⏳ Free-tier rate limit reached. Please wait ~1 minute and try again.")
+                        else:
                             st.error(f"Gemini analysis failed: {e}")
-            else:
-                st.info("🔌 Gemini 3 integration not available. Set GOOGLE_API_KEY to enable.")
-                st.code("export GOOGLE_API_KEY='your-api-key'")
 
 
 if __name__ == "__main__":

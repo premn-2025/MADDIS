@@ -76,6 +76,10 @@ class Gemini3Orchestrator:
         self.model = None
         self.use_mock = False
         
+        # Free-tier rate limiting (15 RPM ≈ 1 call per 4s)
+        self._last_call_time = 0.0
+        self._min_interval = 4.0  # seconds between API calls
+        
         # Circuit breaker settings
         self.circuit_cooldown = 300  # 5 minutes sleep
         
@@ -475,48 +479,46 @@ Molecule {i+1}:
         return "\n\n".join(formatted)
 
     async def _generate_gemini_response(self, prompt: str, max_tokens: int = 128) -> str:
-        """Generate response using Gemini API with retry and explicit sleep on 429"""
+        """Generate response using Gemini 3 with free-tier rate limiting."""
         import asyncio
         import time
-        import random
         
         max_retries = 3
-        base_delay = 2
         
         for attempt in range(max_retries):
             try:
+                # Free-tier throttle
+                elapsed = time.time() - self._last_call_time
+                if elapsed < self._min_interval:
+                    await asyncio.sleep(self._min_interval - elapsed)
+                
+                self._last_call_time = time.time()
                 response = self.model.generate_content(
                     prompt,
                     generation_config={
                         "max_output_tokens": max_tokens,
-                        "temperature": 0.7,
+                        "temperature": 0.3,
                     }
                 )
                 if not response.text:
-                     raise ValueError("Empty response from API")
+                    raise ValueError("Empty response from API")
                 return response.text
                 
             except Exception as e:
                 logger.warning(f"Gemini API error (attempt {attempt+1}/{max_retries}): {str(e)}")
                 error_str = str(e).lower()
                 
-                # Check for rate limit
-                if any(keyword in error_str for keyword in ['quota', 'rate', 'limit', '429', 'resource_exhausted']):
-                    logger.error(f"Rate limit hit in Orchestrator! Sleeping for {self.circuit_cooldown} seconds...")
-                    # Use blocking sleep here if we want to stop everything, or await asyncio.sleep
-                    # Since user wants to "stop all attempts", blocking might be safer to prevent other coroutines from spamming, 
-                    # but asyncio.sleep allows the UI to stay responsive if properly implemented.
-                    # However, to be strict as requested:
-                    await asyncio.sleep(self.circuit_cooldown)
-                    logger.info("Resuming after rate limit sleep")
-                    raise Exception("Rate limit hit - Paused and Aborted for now")
+                if any(kw in error_str for kw in ['quota', 'rate', 'limit', '429', 'resource_exhausted']):
+                    if attempt < max_retries - 1:
+                        wait = 15 * (attempt + 1)
+                        logger.warning(f"Rate limit hit. Waiting {wait}s...")
+                        await asyncio.sleep(wait)
+                        continue
+                    raise Exception("Free-tier rate limit reached. Please wait and retry.")
                 
                 if attempt < max_retries - 1:
-                    # Exponential backoff for non-429 errors
-                    sleep_time = (base_delay * (2 ** attempt)) + (random.random() * 0.5)
-                    await asyncio.sleep(sleep_time)
+                    await asyncio.sleep(3)
                 else:
-                    logger.error("Max retries reached for Gemini 3 API")
                     raise
 
     def _parse_ai_response(self, response_text: str) -> Dict[str, Any]:
