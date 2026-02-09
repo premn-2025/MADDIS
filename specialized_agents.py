@@ -148,7 +148,7 @@ class SynthesisPlanningAgent(AutonomousAgent):
             num_bonds = mol.GetNumBonds()
             num_rings = rdMolDescriptors.CalcNumRings(mol)
             num_heteroatoms = rdMolDescriptors.CalcNumHeteroatoms(mol)
-            bertz_ct = rdMolDescriptors.CalcBertzCT(mol)
+            bertz_ct = Descriptors.BertzCT(mol)
             # Normalized complexity score (0-1)
             complexity = min(1.0, (bertz_ct + num_rings * 10 + num_heteroatoms * 5) / 1000.0)
             return complexity

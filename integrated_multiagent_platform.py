@@ -434,9 +434,9 @@ class UniversalMultiAgentPlatform:
             st.markdown('<div class="agent-card"><h4>⚗️ Synthesis Planner</h4><p>• Retrosynthesis<br>• Route planning</p></div>', unsafe_allow_html=True)
 
     def run_drug_interaction_checker(self):
-        """Drug-Drug Interaction Analysis"""
-        st.subheader("💊 Drug-Drug Interaction Checker")
-        st.markdown("Analyze potential interactions between two drugs")
+        """Drug-Drug Compatibility & Stability Analysis"""
+        st.subheader("💊 Drug Compatibility & Stability Checker")
+        st.markdown("Analyze molecular compatibility, stability, and interaction risk between two compounds")
         
         # Add chat assistant for this section
         if CHAT_ASSISTANT_AVAILABLE:
@@ -444,33 +444,332 @@ class UniversalMultiAgentPlatform:
         
         col1, col2 = st.columns(2)
         with col1:
-            drug_a = st.text_input("Enter Drug A:", placeholder="e.g., aspirin")
+            st.markdown("#### Drug A")
+            drug_a = st.text_input("Name or SMILES:", placeholder="e.g., aspirin or CC(=O)OC1=CC=CC=C1C(=O)O", key="drug_a_input")
         with col2:
-            drug_b = st.text_input("Enter Drug B:", placeholder="e.g., warfarin")
+            st.markdown("#### Drug B")
+            drug_b = st.text_input("Name or SMILES:", placeholder="e.g., warfarin or CC1=C(C2=CC=CC=C2OC1=O)C(=O)CC3=CC=CC=C3", key="drug_b_input")
         
-        if st.button("🔍 Check Interaction", type="primary"):
-            if drug_a and drug_b:
-                # Known dangerous interactions
-                dangerous_pairs = {
-                    ("aspirin", "warfarin"): {"risk": "HIGH", "warning": "Increased bleeding risk - BLACK BOX WARNING"},
-                    ("warfarin", "aspirin"): {"risk": "HIGH", "warning": "Increased bleeding risk - BLACK BOX WARNING"},
-                    ("aspirin", "ibuprofen"): {"risk": "MODERATE", "warning": "GI bleeding risk, reduced cardioprotection"},
-                    ("ibuprofen", "aspirin"): {"risk": "MODERATE", "warning": "GI bleeding risk, reduced cardioprotection"},
-                    ("metformin", "alcohol"): {"risk": "HIGH", "warning": "Lactic acidosis risk"},
-                }
-                
-                key = (drug_a.lower(), drug_b.lower())
-                if key in dangerous_pairs:
-                    info = dangerous_pairs[key]
-                    if info["risk"] == "HIGH":
-                        st.error(f"🚫 **HIGH RISK**: {info['warning']}")
-                    else:
-                        st.warning(f"⚠️ **{info['risk']} RISK**: {info['warning']}")
-                else:
-                    st.success(f"✅ No major interaction found between {drug_a} and {drug_b}")
-                    st.info("Note: Always consult a healthcare provider for medical advice")
+        if st.button("🔍 Analyze Compatibility", type="primary"):
+            if not drug_a or not drug_b:
+                st.warning("Please enter both drug names or SMILES")
+                return
+            
+            mol_a, smiles_a, name_a = self.get_molecule_from_name_or_smiles(drug_a)
+            mol_b, smiles_b, name_b = self.get_molecule_from_name_or_smiles(drug_b)
+            
+            if not mol_a:
+                st.error(f"Could not parse Drug A: **{drug_a}**. Try a known name (aspirin, caffeine…) or a valid SMILES string.")
+                return
+            if not mol_b:
+                st.error(f"Could not parse Drug B: **{drug_b}**. Try a known name (aspirin, caffeine…) or a valid SMILES string.")
+                return
+            
+            with st.spinner("Analyzing molecular compatibility…"):
+                self._display_compatibility_results(mol_a, smiles_a, name_a, mol_b, smiles_b, name_b)
+
+    # ------------------------------------------------------------------
+    # Compatibility helpers
+    # ------------------------------------------------------------------
+    def _compute_mol_profile(self, mol):
+        """Return a dict of pharmacologically relevant properties."""
+        logp = Descriptors.MolLogP(mol)
+        tpsa = Descriptors.TPSA(mol)
+        mw = Descriptors.MolWt(mol)
+        hbd = Descriptors.NumHDonors(mol)
+        hba = Descriptors.NumHAcceptors(mol)
+        rotatable = Descriptors.NumRotatableBonds(mol)
+        aromatic = Descriptors.NumAromaticRings(mol)
+        rings = Descriptors.RingCount(mol)
+        charge = Chem.rdmolops.GetFormalCharge(mol)
+        qed = Descriptors.qed(mol)
+        fsp3 = Descriptors.FractionCSP3(mol)
+
+        # Lipinski violations
+        violations = sum([mw > 500, logp > 5, hbd > 5, hba > 10])
+
+        # Functional-group flags
+        smarts_patterns = {
+            'Carboxylic acid': '[CX3](=O)[OX2H1]',
+            'Amine (primary)': '[NX3;H2;!$(NC=O)]',
+            'Amine (secondary)': '[NX3;H1;!$(NC=O)]',
+            'Amine (tertiary)': '[NX3;H0;!$(NC=O);!$(N=O)]',
+            'Hydroxyl': '[OX2H]',
+            'Ketone': '[CX3](=O)[#6]',
+            'Aldehyde': '[CX3H1](=O)',
+            'Ester': '[CX3](=O)[OX2H0]',
+            'Amide': '[NX3][CX3](=O)',
+            'Nitro': '[$([NX3](=O)=O)]',
+            'Sulfonamide': '[SX4](=[OX1])(=[OX1])([NX3])',
+            'Phenol': '[OX2H][cX3]:[c]',
+            'Thiol': '[SX2H]',
+        }
+        groups_present = []
+        for name, smarts in smarts_patterns.items():
+            pat = Chem.MolFromSmarts(smarts)
+            if pat and mol.HasSubstructMatch(pat):
+                groups_present.append(name)
+
+        return {
+            'MW': mw, 'LogP': logp, 'TPSA': tpsa, 'HBD': hbd, 'HBA': hba,
+            'Rotatable Bonds': rotatable, 'Aromatic Rings': aromatic,
+            'Ring Count': rings, 'Charge': charge, 'QED': qed,
+            'Fsp3': fsp3, 'Lipinski Violations': violations,
+            'Functional Groups': groups_present,
+        }
+
+    def _assess_interaction_risk(self, prof_a, prof_b):
+        """Return (risk_level, reasons) based on property profiles."""
+        reasons = []
+        risk_score = 0  # 0-100
+
+        # Known reactive-group clashes
+        reactive_pairs = [
+            ('Carboxylic acid', 'Amine (primary)', 'Acid-base reaction → salt / amide formation', 25),
+            ('Carboxylic acid', 'Amine (secondary)', 'Acid-base reaction → salt formation', 20),
+            ('Aldehyde', 'Amine (primary)', 'Schiff-base (imine) formation', 30),
+            ('Aldehyde', 'Amine (secondary)', 'Enamine / hemiaminal formation', 25),
+            ('Aldehyde', 'Thiol', 'Thio-hemiacetal formation', 20),
+            ('Carboxylic acid', 'Hydroxyl', 'Possible ester hydrolysis / exchange', 10),
+            ('Ester', 'Amine (primary)', 'Aminolysis (ester → amide conversion)', 20),
+            ('Nitro', 'Thiol', 'Redox interaction risk', 15),
+        ]
+        groups_a = set(prof_a['Functional Groups'])
+        groups_b = set(prof_b['Functional Groups'])
+        for g1, g2, msg, pts in reactive_pairs:
+            if (g1 in groups_a and g2 in groups_b) or (g1 in groups_b and g2 in groups_a):
+                risk_score += pts
+                reasons.append(f"⚗️ **{g1} + {g2}**: {msg}")
+
+        # pH-dependent solubility clash
+        if prof_a['Charge'] != 0 and prof_b['Charge'] != 0 and prof_a['Charge'] * prof_b['Charge'] < 0:
+            risk_score += 15
+            reasons.append("⚡ Opposite formal charges → ionic complexation / precipitation risk")
+
+        # CYP competition (proxy: both highly lipophilic + aromatic)
+        if prof_a['LogP'] > 3 and prof_b['LogP'] > 3:
+            risk_score += 10
+            reasons.append("🧬 Both lipophilic (LogP > 3) → likely compete for CYP450 metabolism")
+        if prof_a['Aromatic Rings'] >= 3 and prof_b['Aromatic Rings'] >= 3:
+            risk_score += 5
+            reasons.append("🔗 Both highly aromatic → π-π stacking / co-precipitation risk")
+
+        # Protein-binding displacement (proxy: high LogP + low TPSA)
+        def high_binding(p):
+            return p['LogP'] > 3 and p['TPSA'] < 80
+        if high_binding(prof_a) and high_binding(prof_b):
+            risk_score += 15
+            reasons.append("🩸 Both predicted high plasma protein binding → displacement interaction risk")
+
+        # Known dangerous name pairs (keep as safety net)
+        dangerous_pairs = {
+            frozenset(["aspirin", "warfarin"]): ("Increased bleeding risk – BLACK BOX WARNING", 40),
+            frozenset(["aspirin", "ibuprofen"]): ("GI bleeding risk, reduced cardioprotection", 25),
+            frozenset(["ibuprofen", "warfarin"]): ("Increased bleeding & GI ulceration risk", 35),
+            frozenset(["metformin", "ethanol"]): ("Lactic acidosis risk", 35),
+        }
+
+        risk_score = min(risk_score, 100)
+        if risk_score >= 40:
+            level = "HIGH"
+        elif risk_score >= 20:
+            level = "MODERATE"
+        else:
+            level = "LOW"
+        return level, risk_score, reasons
+
+    def _assess_stability(self, prof):
+        """Heuristic chemical-stability assessment for one molecule."""
+        flags = []
+        score = 100  # start perfect, deduct
+
+        if 'Aldehyde' in prof['Functional Groups']:
+            score -= 20
+            flags.append("Aldehyde group – susceptible to oxidation & nucleophilic attack")
+        if 'Thiol' in prof['Functional Groups']:
+            score -= 15
+            flags.append("Thiol group – prone to oxidation (disulfide formation)")
+        if 'Ester' in prof['Functional Groups']:
+            score -= 10
+            flags.append("Ester group – hydrolysis-sensitive at extreme pH")
+        if prof['Aromatic Rings'] == 0 and prof['Ring Count'] == 0:
+            score -= 5
+            flags.append("Acyclic structure – may have higher conformational flexibility / metabolic liability")
+        if prof['Fsp3'] < 0.1:
+            score -= 5
+            flags.append("Very flat molecule (Fsp3 < 0.1) – possible crystallization / solubility issues")
+        if prof['LogP'] > 5:
+            score -= 10
+            flags.append("High lipophilicity (LogP > 5) – poor aqueous stability / bioavailability")
+        if prof['MW'] > 500:
+            score -= 5
+            flags.append("High MW (>500) – potential formulation challenges")
+        if prof['TPSA'] > 140:
+            score -= 10
+            flags.append("High TPSA (>140 Å²) – poor membrane permeability")
+
+        score = max(score, 0)
+        if score >= 80:
+            label = "Stable"
+        elif score >= 50:
+            label = "Moderately Stable"
+        else:
+            label = "Unstable / Caution"
+        return label, score, flags
+
+    def _compute_similarity(self, mol_a, mol_b):
+        """Tanimoto similarity on Morgan fingerprints."""
+        from rdkit.DataStructs import TanimotoSimilarity
+        fp_a = AllChem.GetMorganFingerprintAsBitVect(mol_a, 2, nBits=2048)
+        fp_b = AllChem.GetMorganFingerprintAsBitVect(mol_b, 2, nBits=2048)
+        return TanimotoSimilarity(fp_a, fp_b)
+
+    def _display_compatibility_results(self, mol_a, smiles_a, name_a, mol_b, smiles_b, name_b):
+        """Full compatibility dashboard."""
+        prof_a = self._compute_mol_profile(mol_a)
+        prof_b = self._compute_mol_profile(mol_b)
+        risk_level, risk_score, risk_reasons = self._assess_interaction_risk(prof_a, prof_b)
+        stab_a_label, stab_a_score, stab_a_flags = self._assess_stability(prof_a)
+        stab_b_label, stab_b_score, stab_b_flags = self._assess_stability(prof_b)
+        similarity = self._compute_similarity(mol_a, mol_b)
+
+        # ---------- Header metrics ----------
+        st.markdown("---")
+        st.subheader(f"Results: {name_a} + {name_b}")
+
+        m1, m2, m3, m4 = st.columns(4)
+        risk_color = {"HIGH": "🔴", "MODERATE": "🟡", "LOW": "🟢"}[risk_level]
+        m1.metric("Interaction Risk", f"{risk_color} {risk_level}", f"Score {risk_score}/100")
+        m2.metric("Similarity", f"{similarity:.1%}")
+        m3.metric(f"{name_a} Stability", f"{stab_a_score}/100")
+        m4.metric(f"{name_b} Stability", f"{stab_b_score}/100")
+
+        # ---------- Tabs ----------
+        t_inter, t_stab, t_prop, t_struct = st.tabs([
+            "⚠️ Interaction Analysis",
+            "🧪 Stability Report",
+            "📊 Property Comparison",
+            "🧬 3D Structures"
+        ])
+
+        # --- Interaction tab ---
+        with t_inter:
+            if risk_level == "HIGH":
+                st.error(f"🚫 **HIGH interaction risk** (score {risk_score}/100) – co-administration may be dangerous")
+            elif risk_level == "MODERATE":
+                st.warning(f"⚠️ **MODERATE interaction risk** (score {risk_score}/100) – monitor closely")
             else:
-                st.warning("Please enter both drug names")
+                st.success(f"✅ **LOW interaction risk** (score {risk_score}/100) – likely compatible")
+
+            if risk_reasons:
+                st.markdown("#### Identified Risk Factors")
+                for r in risk_reasons:
+                    st.markdown(f"- {r}")
+            else:
+                st.info("No specific reactive-group clashes detected between these molecules.")
+
+            # Functional-group overlay
+            st.markdown("#### Functional Groups Detected")
+            fg_col1, fg_col2 = st.columns(2)
+            with fg_col1:
+                st.markdown(f"**{name_a}**")
+                if prof_a['Functional Groups']:
+                    for g in prof_a['Functional Groups']:
+                        st.markdown(f"  • {g}")
+                else:
+                    st.write("  No reactive groups detected")
+            with fg_col2:
+                st.markdown(f"**{name_b}**")
+                if prof_b['Functional Groups']:
+                    for g in prof_b['Functional Groups']:
+                        st.markdown(f"  • {g}")
+                else:
+                    st.write("  No reactive groups detected")
+
+            st.info("⚕️ **Disclaimer**: This is a computational prediction. Always consult a healthcare professional for clinical decisions.")
+
+        # --- Stability tab ---
+        with t_stab:
+            s_col1, s_col2 = st.columns(2)
+            with s_col1:
+                st.markdown(f"### {name_a}")
+                if stab_a_score >= 80:
+                    st.success(f"✅ **{stab_a_label}** ({stab_a_score}/100)")
+                elif stab_a_score >= 50:
+                    st.warning(f"⚠️ **{stab_a_label}** ({stab_a_score}/100)")
+                else:
+                    st.error(f"🚫 **{stab_a_label}** ({stab_a_score}/100)")
+                if stab_a_flags:
+                    for f in stab_a_flags:
+                        st.write(f"  ⚬ {f}")
+                else:
+                    st.write("  No stability concerns detected.")
+
+            with s_col2:
+                st.markdown(f"### {name_b}")
+                if stab_b_score >= 80:
+                    st.success(f"✅ **{stab_b_label}** ({stab_b_score}/100)")
+                elif stab_b_score >= 50:
+                    st.warning(f"⚠️ **{stab_b_label}** ({stab_b_score}/100)")
+                else:
+                    st.error(f"🚫 **{stab_b_label}** ({stab_b_score}/100)")
+                if stab_b_flags:
+                    for f in stab_b_flags:
+                        st.write(f"  ⚬ {f}")
+                else:
+                    st.write("  No stability concerns detected.")
+
+            # Combined stability assessment
+            st.markdown("---")
+            combined_stab = (stab_a_score + stab_b_score) / 2
+            st.markdown("### Combined Formulation Stability Estimate")
+            if combined_stab >= 75 and risk_score < 20:
+                st.success(f"✅ Favorable combination – combined stability {combined_stab:.0f}/100, low interaction risk")
+            elif combined_stab >= 50:
+                st.warning(f"⚠️ Acceptable with monitoring – combined stability {combined_stab:.0f}/100")
+            else:
+                st.error(f"🚫 Combination raises concerns – combined stability {combined_stab:.0f}/100")
+
+        # --- Property comparison tab ---
+        with t_prop:
+            compare_keys = ['MW', 'LogP', 'TPSA', 'HBD', 'HBA', 'Rotatable Bonds',
+                            'Aromatic Rings', 'Ring Count', 'Charge', 'QED', 'Fsp3', 'Lipinski Violations']
+            comp_df = pd.DataFrame({
+                'Property': compare_keys,
+                name_a: [f"{prof_a[k]:.2f}" if isinstance(prof_a[k], float) else str(prof_a[k]) for k in compare_keys],
+                name_b: [f"{prof_b[k]:.2f}" if isinstance(prof_b[k], float) else str(prof_b[k]) for k in compare_keys],
+            })
+            st.dataframe(comp_df, use_container_width=True, hide_index=True)
+
+            # Radar chart
+            radar_keys = ['QED', 'Fsp3', 'HBD', 'HBA', 'Aromatic Rings']
+            vals_a = [prof_a[k] for k in radar_keys]
+            vals_b = [prof_b[k] for k in radar_keys]
+            # Normalise to 0-1 for radar
+            max_vals = [max(abs(a), abs(b), 1e-9) for a, b in zip(vals_a, vals_b)]
+            norm_a = [v / m for v, m in zip(vals_a, max_vals)]
+            norm_b = [v / m for v, m in zip(vals_b, max_vals)]
+
+            fig = go.Figure()
+            fig.add_trace(go.Scatterpolar(r=norm_a + [norm_a[0]], theta=radar_keys + [radar_keys[0]],
+                                          fill='toself', name=name_a, opacity=0.6))
+            fig.add_trace(go.Scatterpolar(r=norm_b + [norm_b[0]], theta=radar_keys + [radar_keys[0]],
+                                          fill='toself', name=name_b, opacity=0.6))
+            fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 1])),
+                              title="Property Radar Comparison", height=450)
+            st.plotly_chart(fig, use_container_width=True)
+
+        # --- 3D structures tab ---
+        with t_struct:
+            struct_col1, struct_col2 = st.columns(2)
+            with struct_col1:
+                mol_3d_a = self.generate_3d_structure(mol_a)
+                st.plotly_chart(self.create_3d_plot(mol_3d_a, f"{name_a} 3D"), use_container_width=True)
+                st.code(smiles_a, language=None)
+            with struct_col2:
+                mol_3d_b = self.generate_3d_structure(mol_b)
+                st.plotly_chart(self.create_3d_plot(mol_3d_b, f"{name_b} 3D"), use_container_width=True)
+                st.code(smiles_b, language=None)
 
     def run_admet_prediction(self, mol, smiles, name):
         """ADMET Property Prediction"""
@@ -544,7 +843,7 @@ class UniversalMultiAgentPlatform:
             from rdkit.Chem import rdMolDescriptors
             
             # Calculate complexity
-            complexity = rdMolDescriptors.CalcBertzCT(mol)
+            complexity = Descriptors.BertzCT(mol)
             num_rings = rdMolDescriptors.CalcNumRings(mol)
             num_stereo = len(Chem.FindMolChiralCenters(mol))
             
@@ -1072,7 +1371,7 @@ class UniversalMultiAgentPlatform:
                 time.sleep(0.5)
                 results['agents']['molecular_designer'] = {
                     'drug_likeness': Descriptors.qed(mol),
-                    'complexity': rdMolDescriptors.CalcBertzCT(mol) if hasattr(rdMolDescriptors, 'CalcBertzCT') else 100,
+                    'complexity': Descriptors.BertzCT(mol),
                     'recommendation': 'Good drug-like properties' if Descriptors.qed(mol) > 0.5 else 'Consider optimization'
                 }
                 
