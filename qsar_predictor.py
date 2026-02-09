@@ -42,8 +42,12 @@ class QSARPredictor:
     FP_RADIUS = 2
     FP_NBITS = 2048
     
-    def __init__(self, model_dir: str = "models"):
-        self.model_dir = model_dir
+    def __init__(self, model_dir: str = None):
+        # Resolve model directory relative to this file's location (robust for deployment)
+        if model_dir is None:
+            self.model_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+        else:
+            self.model_dir = model_dir
         self.models: Dict[str, object] = {}
         self.metadata: Dict[str, dict] = {}
         self._prediction_cache: Dict[str, dict] = {}
