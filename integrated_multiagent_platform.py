@@ -126,6 +126,19 @@ except ImportError:
 
 LITERATURE_MINING_AVAILABLE = False
 
+# Import QSAR predictor (lightweight - only needs rdkit + sklearn)
+try:
+    from qsar_predictor import QSARPredictor
+    _qsar = QSARPredictor()
+    QSAR_AVAILABLE = _qsar.is_available
+    QSAR_TARGETS = _qsar.available_targets if QSAR_AVAILABLE else []
+    if QSAR_AVAILABLE:
+        logging.getLogger(__name__).info(f"QSAR predictor loaded: {QSAR_TARGETS}")
+except Exception:
+    QSAR_AVAILABLE = False
+    QSAR_TARGETS = []
+    _qsar = None
+
 # Import chemical space analytics
 try:
     from chemical_space_analytics import ChemicalSpaceAnalyzer, render_chemical_space_analytics
@@ -1039,6 +1052,12 @@ class UniversalMultiAgentPlatform:
         # Use reference SMILES as seed if provided and seed is empty
         if reference_smiles and not seed_smiles:
             seed_smiles = reference_smiles
+
+        # Show QSAR model status
+        if QSAR_AVAILABLE:
+            st.success(f"✅ QSAR binding models active for: {', '.join(QSAR_TARGETS)}")
+        else:
+            st.warning("⚠️ QSAR models not available — using fallback scoring")
         
         if st.button("🚀 Generate Molecules", type="primary"):
             if not drug_name:
@@ -1046,9 +1065,9 @@ class UniversalMultiAgentPlatform:
                 return
             
             st.info(f"🎯 Designing **{drug_name}** candidates targeting **{target_protein}** optimized for **{target_property}**")
-            with st.spinner("Generating molecules with RL..."):
-                # Generate molecules
-                generated = self.generate_rl_molecules(target_property, num_molecules, seed_smiles)
+            with st.spinner("Generating molecules with RL (using QSAR binding prediction)..."):
+                # Generate molecules using the REAL RL generator with QSAR
+                generated = self.generate_rl_molecules(target_property, num_molecules, seed_smiles, target_protein)
                 
                 if generated:
                     st.success(f"✅ Generated {len(generated)} molecules!")
@@ -1064,67 +1083,205 @@ class UniversalMultiAgentPlatform:
                                     st.plotly_chart(self.create_3d_plot(mol_3d, f"Mol {i}"), use_container_width=True)
                             with cols[1]:
                                 st.write(f"**SMILES:** `{mol_data['smiles']}`")
+                                st.write(f"**Reward:** {mol_data.get('reward', 0):.3f}")
+                                binding = mol_data.get('binding_affinity', 0)
+                                source = mol_data.get('binding_source', 'N/A')
+                                pic50 = mol_data.get('pic50', None)
+                                if pic50 is not None:
+                                    st.write(f"**Binding (pIC50):** {pic50:.2f} [{source}]")
+                                else:
+                                    st.write(f"**Binding Score:** {binding:.3f} [{source}]")
                                 st.write(f"**QED Score:** {mol_data.get('qed', 0):.3f}")
                                 st.write(f"**LogP:** {mol_data.get('logp', 0):.2f}")
                                 st.write(f"**MW:** {mol_data.get('mw', 0):.1f}")
-                                st.write(f"**Reward:** {mol_data.get('reward', 0):.3f}")
+                                sa = mol_data.get('synthetic_accessibility', None)
+                                if sa is not None:
+                                    st.write(f"**Synth. Accessibility:** {sa:.3f}")
+                                admet = mol_data.get('admet_score', None)
+                                if admet is not None:
+                                    st.write(f"**ADMET Score:** {admet:.3f}")
                 else:
                     st.error("Generation failed. Check RL generator availability.")
 
-    def generate_rl_molecules(self, target, num_mols, seed=None):
-        """Generate molecules using RL"""
+    def generate_rl_molecules(self, target, num_mols, seed=None, target_protein="EGFR"):
+        """Generate molecules using RL with QSAR binding prediction.
+        
+        Uses ImprovedRLMolecularGenerator when available (async calculate_reward
+        with real QSAR binding). Falls back to synchronous QSAR scoring if the
+        full RL generator is unavailable (e.g., torch not installed on Streamlit Cloud).
+        """
         import random
-        
-        # Base scaffolds for generation
-        scaffolds = [
-            "c1ccccc1",  # Benzene
-            "c1ccncc1",  # Pyridine
-            "c1ccc2ccccc2c1",  # Naphthalene
-            "c1ccc2[nH]ccc2c1",  # Indole
-            "c1ccc2occc2c1",  # Benzofuran
-        ]
-        
-        modifications = [
-            "C(=O)O", "C(=O)N", "O", "N", "F", "Cl", "C", "CC", "OC", "NC",
-            "C(=O)OC", "C(=O)NC", "C#N", "S", "C(F)(F)F"
-        ]
-        
+        from rdkit.Chem import QED as QED_module
+
         generated = []
-        for i in range(num_mols):
+
+        # ---- Strategy A: Use ImprovedRLMolecularGenerator (full RL + QSAR) ----
+        if RL_GENERATOR_AVAILABLE:
+            try:
+                rl_gen = ImprovedRLMolecularGenerator(target_protein=target_protein)
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    for _ in range(num_mols * 3):  # Over-generate to get enough valid
+                        result = loop.run_until_complete(rl_gen.generate_and_evaluate_molecule())
+                        rewards = result['rewards']
+                        if rewards.get('validity', 0) > 0.5:
+                            smiles = result['smiles']
+                            mol = Chem.MolFromSmiles(smiles)
+                            if mol:
+                                generated.append({
+                                    'smiles': smiles,
+                                    'reward': rewards.get('total_reward', 0),
+                                    'binding_affinity': rewards.get('binding_affinity', 0),
+                                    'binding_source': rewards.get('binding_source', 'N/A'),
+                                    'qed': rewards.get('drug_likeness', 0),
+                                    'logp': Descriptors.MolLogP(mol),
+                                    'mw': Descriptors.MolWt(mol),
+                                    'synthetic_accessibility': rewards.get('synthetic_accessibility', None),
+                                    'admet_score': rewards.get('admet_score', None),
+                                    'pic50': rewards.get('pic50', None),
+                                })
+                        if len(generated) >= num_mols:
+                            break
+                finally:
+                    loop.close()
+                
+                generated.sort(key=lambda x: x['reward'], reverse=True)
+                return generated[:num_mols]
+            except Exception as e:
+                logging.getLogger(__name__).warning(f"RL generator failed, falling back to QSAR-direct: {e}")
+                generated = []  # Reset and try fallback
+
+        # ---- Strategy B: Scaffold generation + direct QSAR scoring ----
+        # This runs even on Streamlit Cloud where torch is not installed.
+        scaffolds = [
+            "c1ccc2c(c1)cc[nH]2",         # Indole
+            "c1ccc2[nH]c3ccccc3c2c1",      # Carbazole
+            "c1ccc(-c2ccncc2)cc1",          # Phenylpyridine
+            "c1ccc2ncnc(N)c2c1",            # Quinazoline-4-amine (EGFR pharmacophore!)
+            "c1ccc2c(c1)[nH]c1ccccc12",     # Indole-fused
+            "c1cnc2ccccc2n1",               # Quinoxaline
+            "c1ccc2c(c1)cnc1ccccc12",       # Acridine
+            "c1ccnc(-c2ccccn2)c1",          # Bipyridyl
+            "O=c1[nH]c2ccccc2o1",           # Benzoxazinone
+            "c1ccc(-c2ccc3[nH]ncc3c2)cc1",  # Indazole-phenyl
+        ]
+
+        modifications = [
+            "NC(=O)", "NC(=O)C", "Nc1ccncc1", "C(F)(F)F", "OC",
+            "F", "Cl", "N", "NC", "NCC", "NCCN",
+            "C(=O)NC", "C(=O)N(C)C", "C#N", "C(=O)O",
+            "c1ccncc1", "c1ccc(O)cc1", "c1ccc(F)cc1",
+        ]
+
+        # Get or create QSAR predictor
+        qsar = _qsar if QSAR_AVAILABLE else None
+
+        attempts = 0
+        while len(generated) < num_mols and attempts < num_mols * 5:
+            attempts += 1
             scaffold = random.choice(scaffolds)
             mod = random.choice(modifications)
-            
-            # Create molecule
-            smiles = f"{scaffold}{mod}"
-            mol = Chem.MolFromSmiles(smiles)
-            
-            if mol:
+
+            # Try two attachment strategies
+            smiles_candidates = [f"{scaffold}{mod}", f"{mod}{scaffold}"]
+            if seed and Chem.MolFromSmiles(seed):
+                smiles_candidates.append(f"{seed}{mod}")
+
+            for smiles in smiles_candidates:
+                mol = Chem.MolFromSmiles(smiles)
+                if mol is None or '.' in Chem.MolToSmiles(mol):
+                    continue
+
+                num_atoms = mol.GetNumHeavyAtoms()
+                if num_atoms < 8 or num_atoms > 60:
+                    continue
+
+                canonical = Chem.MolToSmiles(mol)
+                # Skip duplicates
+                if any(g['smiles'] == canonical for g in generated):
+                    continue
+
                 try:
-                    qed = Descriptors.qed(mol)
+                    qed_score = QED_module.qed(mol)
                     logp = Descriptors.MolLogP(mol)
                     mw = Descriptors.MolWt(mol)
+
+                    # --- Multi-component reward (matches ImprovedRLMolecularGenerator weights) ---
+                    # 1. Binding affinity via QSAR (weight 0.30)
+                    binding_score = 0.0
+                    binding_source = 'simulated'
+                    pic50_val = None
+
+                    if qsar and target_protein in qsar.available_targets:
+                        pic50_val = qsar.predict_pic50(canonical, target_protein)
+                        if pic50_val is not None:
+                            binding_score = max(0.0, min(1.0, (pic50_val - 4.0) / 6.0))
+                            binding_source = 'QSAR'
                     
-                    # Calculate reward based on target
-                    if "QED" in target:
-                        reward = qed
-                    elif "LogP" in target:
-                        reward = 1.0 - abs(logp - 2.5) / 5.0  # Target LogP ~2.5
-                    else:
-                        reward = qed * 0.5 + (1.0 - abs(logp - 2.5) / 5.0) * 0.5
-                    
+                    if binding_source == 'simulated':
+                        # Fallback: penalise — don't pretend we know binding
+                        binding_score = 0.3
+
+                    # 2. Drug-likeness (weight 0.15)
+                    drug_like = qed_score
+
+                    # 3. Molecular properties — Lipinski (weight 0.10)
+                    prop_score = 1.0
+                    if mw > 500: prop_score -= 0.25
+                    if logp > 5: prop_score -= 0.25
+                    hbd = Descriptors.NumHDonors(mol)
+                    hba = Descriptors.NumHAcceptors(mol)
+                    if hbd > 5: prop_score -= 0.25
+                    if hba > 10: prop_score -= 0.25
+                    prop_score = max(0.0, prop_score)
+
+                    # 4. Synthetic accessibility (weight 0.10)
+                    from rdkit.Chem import rdMolDescriptors as rdmd
+                    try:
+                        from sascorer import calculateScore as sa_calc
+                        sa_raw = sa_calc(mol)
+                    except ImportError:
+                        # Approximate SA from descriptor complexity
+                        sa_raw = min(6, max(1, num_atoms / 8.0))
+                    sa_score = max(0.0, (6 - sa_raw) / 5.0)
+
+                    # 5/6. ADMET + Safety = 0.15 + 0.15 (default 0.5/1.0 without agents)
+                    admet_score = 0.5
+                    safety_score = 1.0
+
+                    # 7. Validity (weight 0.05) — already valid
+                    validity = 1.0
+
+                    # Weighted total (same weights as ImprovedRLMolecularGenerator)
+                    reward = (
+                        0.30 * binding_score +
+                        0.15 * drug_like +
+                        0.10 * prop_score +
+                        0.10 * sa_score +
+                        0.15 * admet_score +
+                        0.15 * safety_score +
+                        0.05 * validity
+                    )
+
                     generated.append({
-                        'smiles': Chem.MolToSmiles(mol),
-                        'qed': qed,
+                        'smiles': canonical,
+                        'reward': reward,
+                        'binding_affinity': binding_score,
+                        'binding_source': binding_source,
+                        'pic50': pic50_val,
+                        'qed': qed_score,
                         'logp': logp,
                         'mw': mw,
-                        'reward': reward
+                        'synthetic_accessibility': sa_score,
+                        'admet_score': admet_score,
                     })
-                except:
-                    pass
-        
-        # Sort by reward
+                    break  # Got one valid molecule from this scaffold
+                except Exception:
+                    continue
+
         generated.sort(key=lambda x: x['reward'], reverse=True)
-        return generated
+        return generated[:num_mols]
 
     def run_multi_target_rl(self):
         """Multi-Target RL Optimization Interface"""
@@ -1197,24 +1354,42 @@ class UniversalMultiAgentPlatform:
             
             # Run optimization
             all_results = []
+            qsar = _qsar if QSAR_AVAILABLE else None
+            
             for gen in range(generations):
                 progress_bar.progress((gen + 1) / generations)
                 status_text.text(f"Generation {gen + 1}/{generations}...")
                 
-                # Generate population for this generation
-                gen_molecules = self.generate_rl_molecules("Multi-objective", population_size)
+                # Generate population for this generation (use first target for scaffold generation)
+                primary_target = targets[0][0] if targets else "EGFR"
+                gen_molecules = self.generate_rl_molecules("Multi-objective", population_size, target_protein=primary_target)
                 
-                # Score against targets
+                # Score against ALL selected targets using QSAR
                 for mol_data in gen_molecules:
                     multi_score = 0
+                    target_scores = {}
+                    total_weight = sum(w for _, w in targets)
+                    
                     for target_name, weight in targets:
-                        # Simulate target-specific scoring
-                        base_score = mol_data['qed'] * 0.5 + (1 - abs(mol_data['logp'] - 2.5)/5) * 0.5
-                        multi_score += base_score * weight
-                    mol_data['multi_target_score'] = multi_score / sum(w for _, w in targets)
+                        if qsar and target_name in qsar.available_targets:
+                            pic50 = qsar.predict_pic50(mol_data['smiles'], target_name)
+                            if pic50 is not None:
+                                binding = max(0.0, min(1.0, (pic50 - 4.0) / 6.0))
+                            else:
+                                binding = 0.3
+                        else:
+                            binding = 0.3  # Fallback
+                        
+                        # Combine binding (70%) + drug-likeness (30%) per target
+                        target_score = 0.7 * binding + 0.3 * mol_data.get('qed', 0.5)
+                        target_scores[target_name] = target_score
+                        multi_score += target_score * weight
+                    
+                    mol_data['multi_target_score'] = multi_score / max(total_weight, 0.01)
+                    mol_data['target_scores'] = target_scores
                 
                 all_results.extend(gen_molecules)
-                time.sleep(0.1)  # Small delay for visual effect
+                time.sleep(0.05)  # Small delay for visual effect
             
             progress_bar.progress(1.0)
             status_text.text("✅ Optimization Complete!")
@@ -1227,13 +1402,21 @@ class UniversalMultiAgentPlatform:
                 st.success(f"🎉 Found {len(top_results)} optimized candidates!")
                 
                 # Results table
-                df = pd.DataFrame([{
-                    'SMILES': r['smiles'][:40] + '...',
-                    'Multi-Target Score': f"{r.get('multi_target_score', 0):.3f}",
-                    'QED': f"{r['qed']:.3f}",
-                    'LogP': f"{r['logp']:.2f}",
-                    'MW': f"{r['mw']:.1f}"
-                } for r in top_results])
+                row_data = []
+                for r in top_results:
+                    row = {
+                        'SMILES': r['smiles'][:40] + '...',
+                        'Multi-Target Score': f"{r.get('multi_target_score', 0):.3f}",
+                        'QED': f"{r['qed']:.3f}",
+                        'Binding Source': r.get('binding_source', 'N/A'),
+                    }
+                    # Add per-target scores
+                    for tname, _ in targets:
+                        tscores = r.get('target_scores', {})
+                        row[f'{tname} Score'] = f"{tscores.get(tname, 0):.3f}"
+                    row_data.append(row)
+                
+                df = pd.DataFrame(row_data)
                 
                 st.dataframe(df, use_container_width=True)
                 
