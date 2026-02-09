@@ -17,7 +17,22 @@ try:
 except Exception:
     pass
 
+# Load .env file for local development
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 import streamlit as st
+
+# Load Streamlit secrets into environment variables (for deployed apps)
+try:
+    for key, value in st.secrets.items():
+        if key not in os.environ or not os.environ[key]:
+            os.environ[key] = str(value)
+except Exception:
+    pass
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
@@ -1479,8 +1494,13 @@ class UniversalMultiAgentPlatform:
                     try:
                         import google.generativeai as genai
                         api_key = os.environ.get('GEMINI_API_KEY', '')
+                        if not api_key:
+                            try:
+                                api_key = st.secrets.get('GEMINI_API_KEY', '')
+                            except Exception:
+                                pass
                         if not api_key or not api_key.startswith('AIza'):
-                            st.error("GEMINI_API_KEY not set. Add it to your `.env` file.")
+                            st.error("GEMINI_API_KEY not set. Add it to your `.env` file or Streamlit secrets.")
                         else:
                             genai.configure(api_key=api_key)
                             model_name = os.environ.get('GEMINI_MODEL', 'gemini-3-flash-preview')

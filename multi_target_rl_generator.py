@@ -26,6 +26,14 @@ try:
 except Exception:
     DOCKING_AVAILABLE = False
 
+# Import QSAR Predictor (REAL binding prediction from ChEMBL-trained models)
+try:
+    from qsar_predictor import QSARPredictor
+    QSAR_AVAILABLE = True
+except ImportError:
+    QSAR_AVAILABLE = False
+    QSARPredictor = None
+
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -65,6 +73,20 @@ class MultiTargetRewardFunction:
             self.docking_agent = docking_agent
         
         self.has_docking = self.docking_agent is not None
+
+        # Initialize QSAR predictor (REAL binding from ChEMBL-trained models)
+        if QSAR_AVAILABLE:
+            try:
+                self.qsar_predictor = QSARPredictor()
+                self.has_qsar = self.qsar_predictor.is_available
+                if self.has_qsar:
+                    logger.info(f" QSAR binding predictor active: {self.qsar_predictor.available_targets}")
+            except Exception:
+                self.qsar_predictor = None
+                self.has_qsar = False
+        else:
+            self.qsar_predictor = None
+            self.has_qsar = False
         self.target_weights = {obj.target_name: obj.weight for obj in objectives}
         self.binding_thresholds = {obj.target_name: obj.binding_threshold for obj in objectives}
         
@@ -230,7 +252,15 @@ class MultiTargetRewardFunction:
         
         for target_name in self.target_weights.keys():
             try:
-                if self.docking_agent is not None:
+                # Priority: QSAR (real ML) > Docking Agent > Simulated
+                if self.has_qsar and target_name in self.qsar_predictor.available_targets:
+                    # REAL prediction from ChEMBL-trained QSAR model
+                    pic50 = self.qsar_predictor.predict_pic50(smiles, target_name)
+                    if pic50 is not None:
+                        affinity = -1.36 * pic50  # Convert pIC50 to kcal/mol
+                    else:
+                        affinity = self._simulate_binding(mol, target_name)
+                elif self.docking_agent is not None:
                     docking_result = await self.docking_agent.dock_molecule(smiles, target_name)
                     affinity = docking_result.binding_affinity
                 else:

@@ -70,6 +70,15 @@ except ImportError:
     check_reactive_groups = lambda x: True  # Fallback: accept all
     logger.warning("Chemical safety filter not available")
 
+# Import QSAR Predictor (REAL binding prediction from ChEMBL-trained models)
+try:
+    from qsar_predictor import QSARPredictor
+    QSAR_AVAILABLE = True
+except ImportError:
+    QSAR_AVAILABLE = False
+    QSARPredictor = None
+    logger.warning("QSAR predictor not available - run download_chembl_data.py and train_qsar_models.py")
+
 
 
 class ValidSMILESGenerator:
@@ -306,6 +315,23 @@ class ImprovedRLMolecularGenerator:
             self.has_admet = False
             logger.warning(" ADMET prediction not available")
 
+        # QSAR predictor (REAL binding from ChEMBL-trained models)
+        if QSAR_AVAILABLE:
+            try:
+                self.qsar_predictor = QSARPredictor()
+                self.has_qsar = self.qsar_predictor.is_available
+                if self.has_qsar:
+                    logger.info(f" QSAR binding predictor active! Targets: {self.qsar_predictor.available_targets}")
+                else:
+                    logger.warning(" QSAR models not trained yet - using fallback docking")
+            except Exception as e:
+                self.qsar_predictor = None
+                self.has_qsar = False
+                logger.warning(f" QSAR predictor init failed: {e}")
+        else:
+            self.qsar_predictor = None
+            self.has_qsar = False
+
 
         # Chemical Safety Filter
         if SAFETY_FILTER_AVAILABLE:
@@ -384,11 +410,16 @@ class ImprovedRLMolecularGenerator:
         prop_score = self._calculate_property_score(mol)
         rewards['molecular_properties'] = prop_score
 
-        # 4. Binding affinity from real docking
-        if self.has_docking:
+        # 4. Binding affinity: prefer QSAR (real ML prediction) > docking > simulated
+        if self.has_qsar and self.target_protein in self.qsar_predictor.available_targets:
+            binding_reward = self.qsar_predictor.get_binding_reward(smiles, self.target_protein)
+            rewards['binding_source'] = 'QSAR'
+        elif self.has_docking:
             binding_reward = await self._real_docking_reward(smiles)
+            rewards['binding_source'] = 'docking'
         else:
             binding_reward = self._simulated_binding_reward(mol)
+            rewards['binding_source'] = 'simulated'
 
         rewards['binding_affinity'] = binding_reward
 

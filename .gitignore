@@ -16,7 +16,9 @@ venv/
 env/
 .venv/
 .venv_new/
+.venv_qsar/
 .env
+.streamlit/secrets.toml
 
 # PyTorch models & checkpoints
 *.pt

@@ -19,6 +19,15 @@ try:
 except ImportError:
     pass
 
+# Load Streamlit secrets into environment variables (for deployed apps)
+try:
+    import streamlit as st
+    for key, value in st.secrets.items():
+        if key not in os.environ or not os.environ[key]:
+            os.environ[key] = str(value)
+except Exception:
+    pass
+
 
 @dataclass
 class ChatbotConfig:

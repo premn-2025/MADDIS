@@ -72,7 +72,8 @@ class RealMolecularDockingAgent:
     Production-Grade Molecular Docking Engine
 
     Performs real structure-based molecular docking with:
-        - Physics-based scoring
+        - QSAR-based binding prediction (trained on ChEMBL data)
+        - Physics-based scoring (fallback)
         - Multiple conformer generation
         - Binding site optimization
         - Interaction fingerprinting
@@ -85,6 +86,18 @@ class RealMolecularDockingAgent:
         self.protein_library = self._initialize_protein_library()
         self.scoring_weights = self._load_scoring_parameters()
         self.docking_cache = {}
+
+        # Initialize QSAR predictor (REAL binding prediction)
+        try:
+            from qsar_predictor import QSARPredictor
+            self.qsar_predictor = QSARPredictor()
+            self.has_qsar = self.qsar_predictor.is_available
+            if self.has_qsar:
+                logger.info(f" QSAR binding predictor loaded: {self.qsar_predictor.available_targets}")
+        except Exception as e:
+            self.qsar_predictor = None
+            self.has_qsar = False
+            logger.warning(f" QSAR predictor not available: {e}")
 
         # Create output directories
         self.output_dir = Path("outputs/docking")
@@ -238,7 +251,7 @@ class RealMolecularDockingAgent:
         # 3. Dock each conformer to binding site
         docking_poses = []
         for conf_id, conformer in enumerate(conformers):
-            pose_result = self._dock_conformer(conformer, target, conf_id)
+            pose_result = self._dock_conformer(conformer, target, conf_id, smiles=smiles)
             docking_poses.append(pose_result)
 
         # 4. Select best pose
@@ -350,7 +363,8 @@ class RealMolecularDockingAgent:
         self,
         conformer: Tuple[int, np.ndarray],
         target: ProteinTarget,
-        conf_id: int
+        conf_id: int,
+        smiles: str = None
     ) -> Dict[str, Any]:
         """Dock single conformer to target binding site"""
         conf_id, coords = conformer
@@ -385,7 +399,7 @@ class RealMolecularDockingAgent:
             ) + binding_center
 
             # Score this pose
-            score = self._score_pose(rotated_coords, target)
+            score = self._score_pose(rotated_coords, target, smiles=smiles)
 
             if score < best_score:
                 best_score = score
@@ -397,9 +411,30 @@ class RealMolecularDockingAgent:
             'coordinates': best_coords
         }
 
-    def _score_pose(self, ligand_coords: np.ndarray, target: ProteinTarget) -> float:
-        """Score a ligand pose in the binding site using target-specific affinity model"""
-
+    def _score_pose(self, ligand_coords: np.ndarray, target: ProteinTarget, smiles: str = None) -> float:
+        """Score a ligand pose using QSAR model (primary) or geometric scoring (fallback).
+        
+        When QSAR models are available, uses ML predictions trained on ChEMBL
+        experimental binding data. Falls back to geometric scoring otherwise.
+        """
+        # PRIMARY: Use QSAR prediction if available
+        if self.has_qsar and smiles is not None:
+            target_name = None
+            # Map protein target to QSAR target name
+            for name, pt in self.protein_library.items():
+                if pt.name == target.name or name == target.name:
+                    target_name = name
+                    break
+            
+            if target_name and target_name in self.qsar_predictor.available_targets:
+                pic50 = self.qsar_predictor.predict_pic50(smiles, target_name)
+                if pic50 is not None:
+                    # Convert pIC50 to docking score (lower = better in docking convention)
+                    # pIC50 of 5 -> score ~7, pIC50 of 8 -> score ~4, pIC50 of 10 -> score ~2
+                    score = 12.0 - pic50
+                    return score
+        
+        # FALLBACK: Geometric scoring (original behavior)
         # Real target-specific affinity model (not dummy values!)
         binding_center = np.array(target.binding_site["center"])
 
