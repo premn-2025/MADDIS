@@ -483,7 +483,6 @@ If you use this pipeline in your research, please cite:
 
 ---
 
-**🎉 You now have a complete, production-ready AI drug discovery pipeline implementing your full 9-phase methodology!**
 
 Get started now:
 ```bash
