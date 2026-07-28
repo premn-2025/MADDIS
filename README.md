@@ -19,7 +19,6 @@ python launch_platform.py
 
 This single command will:
 - ✅ **Download 10+ GB molecular dataset** from ChEMBL, PubChem, ZINC
-- ✅ **Start interactive 3D web interface** at http://localhost:8050
 - ✅ **Enable molecular combination tools** with real-time stability analysis
 - ✅ **Run comprehensive stability analysis** on molecules
 - ✅ **Open browser automatically** for immediate access
