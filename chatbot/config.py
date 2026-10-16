@@ -52,17 +52,28 @@ class ChatbotConfig:
     max_history_length: int = 6  # 3 exchanges
     context_max_chars: int = 1200
     
+    @staticmethod
+    def _get_secret(key: str, default: str = '') -> str:
+        """Get secret from Streamlit secrets first, then fall back to env vars."""
+        try:
+            import streamlit as st
+            if key in st.secrets:
+                return str(st.secrets[key])
+        except Exception:
+            pass
+        return os.getenv(key, default)
+
     @classmethod
     def from_env(cls) -> 'ChatbotConfig':
-        """Create from environment"""
+        """Create from Streamlit secrets or environment"""
         return cls(
-            gemini_api_key=os.getenv('GEMINI_API_KEY', ''),
-            gemini_model=os.getenv('GEMINI_MODEL', 'gemini-3-flash-preview'),
-            model_provider=os.getenv('MODEL_PROVIDER', 'gemini'),
-            ollama_host=os.getenv('OLLAMA_HOST', 'http://localhost:11434'),
-            ollama_model=os.getenv('OLLAMA_MODEL', 'gemma2:9b'),
-            temperature=float(os.getenv('CHATBOT_TEMPERATURE', '0.1')),
-            max_output_tokens=int(os.getenv('CHATBOT_MAX_TOKENS', '1024'))
+            gemini_api_key=cls._get_secret('GEMINI_API_KEY'),
+            gemini_model=cls._get_secret('GEMINI_MODEL', 'gemini-3-flash-preview'),
+            model_provider=cls._get_secret('MODEL_PROVIDER', 'gemini'),
+            ollama_host=cls._get_secret('OLLAMA_HOST', 'http://localhost:11434'),
+            ollama_model=cls._get_secret('OLLAMA_MODEL', 'gemma2:9b'),
+            temperature=float(cls._get_secret('CHATBOT_TEMPERATURE', '0.1')),
+            max_output_tokens=int(cls._get_secret('CHATBOT_MAX_TOKENS', '1024'))
         )
     
     def validate(self) -> tuple[bool, str]:

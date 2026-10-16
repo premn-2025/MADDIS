@@ -1,0 +1,151 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  syntax:
+    # Eight files were committed with corrupted indentation and sat broken for
+    # months because nothing ever tried to parse them. This job makes that
+    # impossible to repeat.
+    name: Syntax gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Compile every tracked Python file
+        run: |
+          set -euo pipefail
+          failed=0
+          while IFS= read -r f; do
+            case "$f" in
+              legacy/*) continue ;;   # known-broken, quarantined on purpose
+            esac
+            if ! python -m py_compile "$f" 2>/tmp/err; then
+              echo "::error file=$f::$(head -3 /tmp/err | tr '\n' ' ')"
+              failed=1
+            fi
+          done < <(git ls-files '*.py')
+          exit $failed
+
+      - name: Confirm quarantined files are still quarantined
+        run: |
+          # If someone repairs one of these, they should move it out of legacy/
+          # rather than leaving a working file in the quarantine directory.
+          for f in legacy/*.py; do
+            if python -m py_compile "$f" 2>/dev/null; then
+              echo "::notice file=$f::now parses - move it out of legacy/"
+            fi
+          done
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Run tests
+        run: pytest tests/ -v
+
+  deploy-check:
+    name: Deployment readiness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Import the Streamlit entry point
+        # Catches the class of breakage that only shows up at deploy time:
+        # a missing module, a bad top-level import, a syntax error in a
+        # transitively imported file.
+        run: python -c "import integrated_multiagent_platform"
+
+      - name: Applicability-domain caches are committed
+        # Without these the app rebuilds them from the ChEMBL CSVs on first
+        # use, which takes ~40s and stalls a cold container. 5s with them.
+        run: |
+          set -euo pipefail
+          missing=0
+          for t in EGFR COX2 BACE1 JAK2 THROMBIN; do
+            if ! git ls-files --error-unmatch "models/${t}_ad.npz" >/dev/null 2>&1; then
+              echo "::error::models/${t}_ad.npz is not committed."
+              echo "Run 'python build_domain_caches.py' and commit the result."
+              missing=1
+            fi
+          done
+          exit $missing
+
+      - name: XSRF protection is enabled
+        # The Batch Screening page accepts file uploads; Streamlit's XSRF
+        # protection is what guards that endpoint.
+        run: |
+          if grep -qE '^\s*enableXsrfProtection\s*=\s*false' .streamlit/config.toml; then
+            echo "::error file=.streamlit/config.toml::XSRF protection is disabled but the app accepts uploads."
+            exit 1
+          fi
+          echo "XSRF protection enabled."
+
+      - name: Cold-start budget
+        # A slow import blocks the first page render on Streamlit Cloud.
+        run: |
+          python - <<'PY'
+          import time, sys
+          t = time.time()
+          import integrated_multiagent_platform  # noqa: F401
+          elapsed = time.time() - t
+          print(f"cold import: {elapsed:.1f}s")
+          if elapsed > 25:
+              print(f"::error::cold import took {elapsed:.1f}s (budget 25s). "
+                    "Check that models/*_ad.npz are present and that nothing "
+                    "heavy runs at module scope.")
+              sys.exit(1)
+          PY
+
+  smoke:
+    name: App renders
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Render every analysis mode
+        # Catches NameErrors and bad imports inside rarely-taken UI branches,
+        # which neither the syntax gate nor the import check can see.
+        run: pytest tests/test_app_smoke.py -v

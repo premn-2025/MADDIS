@@ -17,6 +17,7 @@ env/
 .venv/
 .venv_new/
 .venv_qsar/
+.venv312/
 .env
 .streamlit/secrets.toml
 

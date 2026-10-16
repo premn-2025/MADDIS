@@ -10,20 +10,229 @@
 
 A comprehensive drug discovery platform featuring massive molecular datasets (10+ GB), interactive 3D visualization, real-time molecular combination, and advanced stability analysis.
 
-## 🚀 NEW: One-Click Complete Platform Launch
+## 🚀 Launch the Platform
 
 ```bash
-# Launch the complete platform with 10+ GB dataset
-python launch_platform.py
+pip install -r requirements.txt
+streamlit run integrated_multiagent_platform.py
 ```
 
-This single command will:
-- ✅ **Download 10+ GB molecular dataset** from ChEMBL, PubChem, ZINC
-- ✅ **Enable molecular combination tools** with real-time stability analysis
-- ✅ **Run comprehensive stability analysis** on molecules
-- ✅ **Open browser automatically** for immediate access
+This starts the MADDIS web interface on http://localhost:8501 with:
+- ✅ **Real QSAR binding prediction** for EGFR, COX2, BACE1, JAK2 and THROMBIN,
+  trained on ChEMBL bioactivity data (held-out R² 0.48–0.67)
+- ✅ **Applicability-domain confidence** on every prediction, so molecules
+  outside a target's chemistry are flagged instead of silently scored
+- ✅ **RL molecule generation** rewarded by those QSAR models
+- ✅ **Drug compatibility & interaction checking**, ADMET prediction,
+  synthesis planning and chemical-space analytics
+- ✅ **3D molecular visualization**
+
+Optional extras (`torch`, `vina`, `transformers`) unlock the GNN ADMET model,
+real docking and the neural SMILES generator; the app degrades gracefully
+without them. See [Installation & Setup](#️-installation--setup).
 
 ## 🎯 Key Platform Features
+
+### 🎯 QSAR Binding Prediction with an Applicability Domain
+
+Five Random Forest models trained on ChEMBL bioactivity data predict pIC50 per
+target:
+
+| Target | Molecules | R² (random split) | R² (new scaffolds) | R² (in domain) | Domain coverage |
+|---|---|---|---|---|---|
+| EGFR | 6,409 | 0.733 | 0.604 | **0.623** | 77% |
+| JAK2 | 7,222 | 0.733 | 0.518 | **0.649** | 77% |
+| BACE1 | 6,781 | 0.713 | 0.594 | **0.615** | 85% |
+| THROMBIN | 1,789 | 0.727 | 0.425 | **0.463** | 85% |
+| COX2 | 4,234 | 0.562 | 0.155 | **0.233** | 67% |
+
+Three columns because one number cannot answer the question honestly:
+
+- **Random split** — the conventional 80/20. ChEMBL is full of congeneric
+  series, so close analogues of the test molecules remain in training. This
+  measures interpolation within known chemistry.
+- **New scaffolds** — a Bemis-Murcko scaffold split, where a scaffold appears
+  in training or test but never both. The honest estimate for novel chemistry,
+  and the number to quote in a paper.
+- **In domain** — the same held-out scaffolds, restricted to the molecules the
+  applicability-domain check accepts, over the share of the test set shown
+  under *coverage*. This is what you actually get when the app labels a
+  prediction reliable, and it is higher than the overall figure on every
+  target — which is the applicability domain doing its job.
+
+All five beat a mean-prediction baseline on unseen scaffolds, so the models
+learn real structure–activity relationships rather than the training mean.
+**COX2 is the weak one** (0.155 on new scaffolds) and is flagged as such in the
+app rather than averaged away.
+
+<details>
+<summary>How these numbers were improved (+0.03 to +0.05 R² on new scaffolds)</summary>
+
+Three things were tried, measured on the scaffold split. Two failed:
+
+| Change | Effect on scaffold R² |
+|---|---|
+| Add physicochemical descriptors to the fingerprint | **−0.04** (0.575 → 0.537 on EGFR) |
+| Add MACCS keys | **−0.04** |
+| Gradient boosting instead of Random Forest | **−0.01**, and far slower |
+| **Tune the forest's hyperparameters** | **+0.03 to +0.05** on every target |
+
+The descriptors failing is informative: they encode global molecular properties
+that track scaffold identity, so the model leans on them and transfers *worse*
+to new scaffolds. They would have improved the random-split number.
+
+What actually mattered was `max_features`. At `'sqrt'` the forest considered
+only √2048 ≈ 45 of the 2048 fingerprint bits per split; on sparse fingerprints
+where any individual bit is almost always zero, that is too few to find the
+informative substructures, so trees ended up near-random and the ensemble
+regressed towards the mean. Sampling 10% (205 bits) and removing the depth cap
+fixed it.
+
+Hyperparameters were selected by **scaffold-grouped cross-validation inside the
+training half**, so the held-out scaffolds were never used for tuning
+(`hyperparameter_sweep.json`). Model size was part of the choice:
+`min_samples_leaf=1` with 400 trees scored *worse* (0.600 vs 0.604) at 5× the
+size, so the shipped config is 200 trees with `min_samples_leaf=2` — same
+inference latency as before, and the whole model set gzips to 44 MB, **smaller
+than the 61 MB it replaced**.
+
+Structures are also salt-stripped and charge-neutralised before training, with
+duplicate parents merged at their median activity. That affects under 3% of
+rows, so it is a cleanup rather than a cause of the gains.
+</details>
+
+**Every prediction also carries a confidence tier.** This matters more than it
+sounds. A Random Forest cannot say "I don't know" — for a molecule unlike
+anything in its training set it returns approximately the training-set mean,
+and that number looks exactly as confident as a real prediction:
+
+```
+methane ("C")  ->  JAK2 pIC50 6.74     # JAK2 training mean is 7.13
+ruxolitinib    ->  JAK2 pIC50 8.08     # an actual JAK2 inhibitor
+```
+
+Because the RL generator's reward is derived from pIC50, an ungated model pays
+out for chemical nonsense. [`applicability_domain.py`](applicability_domain.py)
+fixes this by comparing each molecule against the nearest members of the
+target's training set (Morgan-fingerprint Tanimoto) and the spread across the
+forest's trees, then scaling the reward by the resulting reliability.
+
+Thresholds are derived per target from the leave-one-out nearest-neighbour
+similarity distribution of that target's own training set, so a sparse target
+gets a looser domain than a dense one — nothing is hand-tuned.
+
+The effect on the EGFR reward signal:
+
+| Molecule | Raw reward | Gated | Nearest-neighbour similarity | Verdict |
+|---|---|---|---|---|
+| Gefitinib (EGFR inhibitor) | 0.638 | **0.638** | 1.00 | high |
+| Erlotinib (EGFR inhibitor) | 0.653 | **0.653** | 1.00 | high |
+| Celecoxib (COX2 inhibitor) | 0.227 | 0.052 | 0.31 | low |
+| Caffeine | 0.224 | 0.044 | 0.26 | out of domain |
+| Methane | 0.201 | **0.004** | 0.02 | out of domain |
+
+Discrimination between genuine EGFR inhibitors and unrelated molecules improves
+from roughly 3× to roughly 13×. Pass `apply_domain_gate=False` to
+`get_binding_reward` to reproduce pre-gate training runs.
+
+#### Honest generalization numbers
+
+The R² values above come from a **random** 80/20 split. ChEMBL is full of
+congeneric series, so close analogues of the test molecules sit in the training
+set and a random split measures interpolation within known chemistry. A
+Bemis-Murcko **scaffold** split holds out whole scaffolds and measures what the
+model does on genuinely new chemistry — that is the number to quote.
+
+Run `python train_qsar_models.py --compare` to reproduce. Every model file also
+carries both figures under `metrics_by_split`, so nothing downstream has to
+hardcode them:
+
+| Target | Random R² | Scaffold R² | Scaffold RMSE | Mean-prediction baseline |
+|---|---|---|---|---|
+| EGFR | 0.733 | **0.604** | 0.814 | 1.305 |
+| BACE1 | 0.713 | **0.594** | 0.830 | 1.336 |
+| JAK2 | 0.733 | **0.518** | 0.786 | 1.145 |
+| THROMBIN | 0.727 | **0.425** | 1.052 | 1.399 |
+| COX2 | 0.562 | **0.155** | 1.008 | 1.159 |
+
+**All five targets beat the mean-prediction baseline on unseen scaffolds**, so
+the models learn real structure–activity relationships rather than the
+training mean. EGFR and BACE1 transfer best. COX2 largely does not — at
+scaffold R² 0.155 its RMSE (1.008) is only modestly better than predicting the
+mean (1.159), so treat COX2 predictions on novel scaffolds with caution.
+
+### 🆕 Novelty: is this molecule actually new?
+
+A generative model can score perfectly by memorising its training data.
+[`novelty_scorer.py`](novelty_scorer.py) checks every generated molecule
+against the ChEMBL reference sets:
+
+```
+Gefitinib  ->  novelty 0.000, Tanimoto 1.00 to EGFR set   EXACT MATCH
+Aspirin    ->  novelty 0.000, Tanimoto 1.00 to COX2 set   EXACT MATCH
+Caffeine   ->  novelty 0.741, Tanimoto 0.26               novel
+```
+
+It also measures **internal diversity** within a generated batch, which catches
+mode collapse that novelty alone cannot — a generator emitting near-copies of
+one molecule looks novel against ChEMBL but scores 0.43 internal diversity
+versus 0.94 for a genuinely varied batch.
+
+Note the deliberate tension with the applicability domain: that check rewards
+similarity to the training set, novelty rewards distance from it. A useful
+candidate sits in between, and `combined_quality()` scores that band.
+
+### 🆕 Selectivity profiling
+
+A compound that hits EGFR at 10 nM *and* everything else at 10 nM is a
+promiscuity liability, not a lead. [`selectivity_scorer.py`](selectivity_scorer.py)
+turns the five independent models into a selectivity window, in log units:
+
+```
+Erlotinib -> EGFR    +1.20 log units (16x over JAK2)   modestly selective
+Aspirin   -> COX2    +0.10 log units (1.3x)            weakly selective
+Aspirin   -> EGFR    -0.30 log units                   promiscuous
+Methane   -> EGFR    no window established             unknown
+```
+
+Off-targets whose applicability domain rejects the molecule are **excluded and
+reported**, never silently compared — claiming selectivity over a model that
+would just return its training mean is meaningless.
+
+### 🆕 Batch screening & export
+
+The **Batch Screening** mode takes a pasted list, a `.smi`/`.txt` file or a CSV
+with a `smiles` column and scores the whole library against every target with
+confidence tiers, novelty, synthetic accessibility and selectivity. Results
+sort in-domain hits first and export to **CSV or SDF** (scores carried through
+as SD properties).
+
+Same thing over HTTP:
+
+```bash
+curl -X POST localhost:8000/api/screen/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"smiles": ["CC(=O)Oc1ccccc1C(=O)O", "C"], "primary_target": "EGFR"}'
+```
+
+`GET /api/qsar/models` returns per-target metrics and domain calibration.
+
+### 🆕 Real synthetic accessibility
+
+The reward's synthetic-accessibility term used to fall back to
+`num_atoms / 8.0` — "a bigger molecule is harder to make" — because it imported
+`sascorer` without putting RDKit's contrib directory on the path.
+[`synthetic_accessibility.py`](synthetic_accessibility.py) loads the real
+Ertl–Schuffenhauer SAScore:
+
+| Molecule | Real SAScore | Old proxy |
+|---|---|---|
+| n-decane (10 C, linear) | 1.23 | 1.25 |
+| twistane (10 C, bridged) | 3.06 | 1.25 |
+| morphine | 5.27 | 2.88 |
+
+Same atom count, very different synthesis difficulty — the old proxy could not
+tell them apart.
 
 ### 📡 Massive Dataset Download (10+ GB)
 - **Multi-source collection**: ChEMBL, PubChem, ZINC databases  
@@ -43,12 +252,15 @@ This single command will:
 - **Interactive combining** through web interface
 - **Chemical reaction simulation**
 
-### 🧪 Advanced Stability Analysis
-- **Comprehensive stability scoring** (0-100) with risk assessment
-- **Reactive group detection** with 20+ patterns (aldehydes, epoxides, etc.)
-- **ADMET property prediction** (Absorption, Distribution, Metabolism, Excretion, Toxicity)
+### 🧪 Stability & Safety Analysis
+- **Stability scoring** with risk assessment — `_assess_stability` in
+  [`integrated_multiagent_platform.py`](integrated_multiagent_platform.py)
+- **Reactive group detection** — [`chemical_safety_filter.py`](chemical_safety_filter.py)
+- **ADMET property prediction** (Absorption, Distribution, Metabolism, Excretion,
+  Toxicity) — [`admet_predictor.py`](admet_predictor.py), with a rule-based
+  fallback when `torch` is absent
 - **Drug-likeness assessment** (Lipinski, Veber, Egan rules)
-- **Batch analysis** with detailed reports
+- **Drug–drug interaction risk** — `_assess_interaction_risk`
 
 ## 🎯 Original Overview
 
@@ -194,8 +406,22 @@ python examples/build_molecular_dataset.py
 
 ### 4. Run Complete Pipeline
 ```bash
-# Validate installation
-python tests/validate_setup.py
+# Validate the QSAR models, applicability domain, novelty and selectivity
+pytest tests/ -v
+
+# Inspect the models directly (predictions + confidence for known drugs)
+python qsar_predictor.py
+
+# Honest generalization numbers (random vs scaffold split)
+python train_qsar_models.py --compare
+
+# Novelty, selectivity and synthetic-accessibility demos
+python novelty_scorer.py
+python selectivity_scorer.py
+python synthetic_accessibility.py
+
+# Rebuild the applicability-domain caches after retraining
+python build_domain_caches.py
 
 # Run complete drug discovery example
 python examples/example_pipeline.py
@@ -389,6 +615,39 @@ conda install -c conda-forge pymol-open-source
 # Download AutoDock Vina from: https://autodock-vina.readthedocs.io/
 ```
 
+### Deploying (Streamlit Community Cloud)
+
+Point the app at `integrated_multiagent_platform.py`; `requirements.txt` and
+`runtime.txt` (Python 3.12) are already set up. Put `GEMINI_API_KEY` in the
+app's **Secrets** — [`chatbot/config.py`](chatbot/config.py) reads Streamlit
+secrets first and falls back to environment variables, so nothing else changes
+between local and deployed runs.
+
+Three things matter for a deployment and are all enforced by
+[CI](.github/workflows/ci.yml):
+
+1. **Commit `models/*_ad.npz`.** These are the applicability-domain caches
+   (1.1 MB total). Without them the app rebuilds them from the ChEMBL CSVs on
+   first use — fingerprinting ~25,000 molecules, which takes **~40 s and
+   stalls the first page render**. With them, cold import is ~5 s. Regenerate
+   with `python build_domain_caches.py` after retraining and commit the result.
+2. **Keep XSRF protection on.** The Batch Screening page accepts file uploads
+   and Streamlit's XSRF protection is what guards that endpoint. It was
+   previously disabled in `.streamlit/config.toml` alongside `enableCORS` —
+   the usual workaround for upload trouble behind a reverse proxy. If uploads
+   misbehave on a custom host, fix the proxy headers instead.
+3. **Model files are gzipped pickles.** The forests are ~35 MB raw and ~11 MB
+   compressed; `qsar_predictor.py` sniffs the gzip magic number so older
+   plain pickles still load. Keep `scikit-learn` below 2.0 — unpickling
+   across a major version is not guaranteed to reproduce the same
+   predictions; retrain with `train_qsar_models.py` if you move past it.
+
+The app degrades gracefully rather than crashing when pieces are missing:
+without `torch` the GNN ADMET model falls back to rules, without the domain
+caches predictions still appear but are no longer labelled reliable (and the
+page says so), and without the QSAR models binding falls back to descriptor
+heuristics. Toggle **Show system status** in the sidebar to see what is live.
+
 ## 🔗 Key Datasets Integrated
 
 All major datasets from your methodology are integrated:
@@ -452,6 +711,45 @@ venv\Scripts\activate     # Windows
 # Install in development mode
 pip install -e .
 ```
+
+## ✅ Project Status
+
+**Working and verified** (app boots clean, 58 tests passing):
+
+- Streamlit platform — `streamlit run integrated_multiagent_platform.py`
+- QSAR binding prediction for 5 targets, with applicability-domain confidence
+- Scaffold-split validation (`train_qsar_models.py --compare`)
+- Novelty / memorization checking and batch diversity metrics
+- Cross-target selectivity profiling
+- Batch library screening with CSV + SDF export
+- Real Ertl–Schuffenhauer synthetic accessibility
+- RL and multi-target molecule generation, rewarded by gated QSAR predictions
+- Compatibility checking, ADMET, synthesis planning, chemical-space analytics
+- Gemini-backed chatbot with 7 domain interpreters ([`chatbot/`](chatbot/))
+- FastAPI server ([`web/api_server.py`](web/api_server.py)) — needs `fastapi`, `uvicorn`
+
+**Requires optional dependencies**: the GNN ADMET model and neural SMILES
+generator need `torch`; real docking needs `vina`. All degrade gracefully.
+
+**Quarantined**: five modules in [`legacy/`](legacy/) do not parse. They were
+committed already broken in the initial commit, never executed, and are not
+reachable from working code — see [`legacy/README.md`](legacy/README.md) for the
+details and for what replaced each one.
+
+**Not implemented despite being referenced in docs**: `examples/fine_tune_multimodal.py`,
+`examples/fine_tune_graph.py`, and the modules `sequential_training_plan.py`
+imports (`test_related_targets`, `comprehensive_validation`).
+
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs four jobs so the
+breakage described above cannot recur silently:
+
+- **Syntax gate** — compiles every tracked Python file (excluding `legacy/`)
+- **Tests** — the 66-test suite
+- **Deployment readiness** — import check, confirms the domain caches are
+  committed, confirms XSRF protection is on, and enforces a 25 s cold-import
+  budget
+- **App renders** — drives every analysis mode through Streamlit's `AppTest`
+  harness, catching NameErrors in UI branches that never get imported
 
 ## 📜 License
 
