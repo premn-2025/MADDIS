@@ -7,7 +7,11 @@
 streamlit>=1.32.0
 numpy>=1.21.0
 pandas>=1.3.0
-scikit-learn>=1.8.0
+# The QSAR models in models/*.pkl were pickled with scikit-learn 1.8.0.
+# Unpickling across a major version raises InconsistentVersionWarning and is
+# not guaranteed to produce the same predictions, so keep this below 2.0.
+# If you bump past it, retrain with train_qsar_models.py.
+scikit-learn>=1.8.0,<2.0
 matplotlib>=3.5.0
 seaborn>=0.11.0
 
