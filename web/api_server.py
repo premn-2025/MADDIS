@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 # Import existing modules
 try:
     from rdkit import Chem
-    from rdkit.Chem import AllChem, Descriptors, DataStructs, rdFingerprintGenerator
+    from rdkit.Chem import AllChem, Descriptors, DataStructs, QED, rdFingerprintGenerator
     RDKIT_AVAILABLE = True
 except ImportError:
     RDKIT_AVAILABLE = False
@@ -69,16 +69,57 @@ except:
     CHEMICAL_ANALYTICS_AVAILABLE = False
 
 try:
-    from advanced_stability_analyzer import AdvancedStabilityAnalyzer
-    STABILITY_ANALYZER_AVAILABLE = True
+    from chemical_safety_filter import ChemicalSafetyFilter
+    SAFETY_FILTER_AVAILABLE = True
 except:
-    STABILITY_ANALYZER_AVAILABLE = False
+    SAFETY_FILTER_AVAILABLE = False
 
 try:
     from admet_predictor import ADMETAgent
     ADMET_AVAILABLE = True
 except:
     ADMET_AVAILABLE = False
+
+# QSAR binding prediction + applicability domain
+try:
+    from qsar_predictor import QSARPredictor
+    # allow_domain_build=False: building a missing cache fingerprints every
+    # training molecule (~40s), far too slow to do inside a request. The
+    # prebuilt caches live in models/*_ad.npz.
+    _qsar = QSARPredictor(allow_domain_build=False)
+    QSAR_AVAILABLE = _qsar.is_available
+    QSAR_TARGETS = _qsar.available_targets if QSAR_AVAILABLE else []
+except Exception:
+    QSAR_AVAILABLE = False
+    QSAR_TARGETS = []
+    _qsar = None
+
+try:
+    from novelty_scorer import NoveltyScorer
+    _novelty = NoveltyScorer(allow_build=False)
+    NOVELTY_AVAILABLE = _novelty.is_available
+except Exception:
+    NOVELTY_AVAILABLE = False
+    _novelty = None
+
+try:
+    from selectivity_scorer import SelectivityScorer
+    _selectivity = SelectivityScorer(predictor=_qsar) if QSAR_AVAILABLE else None
+    SELECTIVITY_AVAILABLE = _selectivity is not None and _selectivity.is_available
+except Exception:
+    SELECTIVITY_AVAILABLE = False
+    _selectivity = None
+
+try:
+    from synthetic_accessibility import SA_AVAILABLE, sa_label, sa_score
+except Exception:
+    SA_AVAILABLE = False
+
+    def sa_score(mol):
+        return None
+
+    def sa_label(mol):
+        return "unknown"
 
 try:
     from real_docking_agent import RealMolecularDockingAgent
@@ -197,6 +238,15 @@ class MultiTargetInput(BaseModel):
 class CompatibilityInput(BaseModel):
     smiles1: str
     smiles2: str
+
+class BatchScreenInput(BaseModel):
+    smiles: List[str]
+    primary_target: str = "EGFR"
+    include_novelty: bool = True
+    include_selectivity: bool = True
+    # Out-of-domain predictions are the training mean dressed up as a result;
+    # callers screening a real library usually want them gone.
+    drop_out_of_domain: bool = False
 
 # Helper functions
 def lookup_pubchem(drug_name: str):
@@ -366,10 +416,17 @@ async def get_status():
             "rl_generation": RL_GENERATOR_AVAILABLE,
             "multitarget_rl": MULTITARGET_RL_AVAILABLE,
             "chemical_space": CHEMICAL_ANALYTICS_AVAILABLE,
-            "stability": STABILITY_ANALYZER_AVAILABLE,
+            "safety_filter": SAFETY_FILTER_AVAILABLE,
             "admet": ADMET_AVAILABLE,
-            "docking": REAL_DOCKING_AVAILABLE
-        }
+            "docking": REAL_DOCKING_AVAILABLE,
+            "qsar": QSAR_AVAILABLE,
+            "applicability_domain": bool(_qsar is not None and _qsar.domain is not None),
+            "novelty": NOVELTY_AVAILABLE,
+            "selectivity": SELECTIVITY_AVAILABLE,
+            "synthetic_accessibility": SA_AVAILABLE,
+            "batch_screening": QSAR_AVAILABLE
+        },
+        "qsar_targets": QSAR_TARGETS
     }
 
 @app.post("/api/molecule")
@@ -984,6 +1041,142 @@ async def generate_multitarget(data: MultiTargetInput):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/qsar/models")
+async def qsar_model_info():
+    """QSAR model metrics and applicability-domain calibration per target."""
+    if not QSAR_AVAILABLE or _qsar is None:
+        raise HTTPException(
+            status_code=503,
+            detail="QSAR models unavailable. Run download_chembl_data.py then "
+                   "train_qsar_models.py."
+        )
+    return {"targets": _qsar.get_model_info()}
+
+
+@app.post("/api/screen/batch")
+async def screen_batch(data: BatchScreenInput):
+    """Screen a library against every QSAR target.
+
+    Returns one record per molecule with per-target pIC50 and confidence,
+    plus optional novelty and selectivity. Predictions flagged
+    `out_of_domain` are the model's training mean rather than a real estimate -
+    set `drop_out_of_domain` to omit their pIC50 values.
+    """
+    if not QSAR_AVAILABLE or _qsar is None:
+        raise HTTPException(
+            status_code=503,
+            detail="QSAR models unavailable. Run download_chembl_data.py then "
+                   "train_qsar_models.py."
+        )
+
+    if not data.smiles:
+        raise HTTPException(status_code=400, detail="No SMILES supplied")
+
+    MAX_BATCH = 5000
+    if len(data.smiles) > MAX_BATCH:
+        raise HTTPException(
+            status_code=413,
+            detail=f"{len(data.smiles)} molecules exceeds the {MAX_BATCH} limit; "
+                   f"split the request."
+        )
+
+    if data.primary_target not in QSAR_TARGETS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown target {data.primary_target!r}. "
+                   f"Available: {', '.join(QSAR_TARGETS)}"
+        )
+
+    results = []
+    invalid = []
+
+    for smi in data.smiles:
+        mol = Chem.MolFromSmiles(smi) if RDKIT_AVAILABLE else None
+        if mol is None:
+            invalid.append(smi)
+            continue
+
+        canonical = Chem.MolToSmiles(mol)
+        raw_sa = sa_score(mol)
+
+        record = {
+            "input": smi,
+            "smiles": canonical,
+            "properties": {
+                "mw": round(Descriptors.MolWt(mol), 2),
+                "logp": round(Descriptors.MolLogP(mol), 2),
+                "tpsa": round(Descriptors.TPSA(mol), 1),
+                "qed": round(QED.qed(mol), 3),
+                "sa_score": round(raw_sa, 2) if raw_sa is not None else None,
+                "synthesis_difficulty": sa_label(mol),
+            },
+            "targets": {},
+        }
+
+        preds = _qsar.predict_all_targets(canonical)
+        for target, entry in preds.items():
+            out = dict(entry)
+            if data.drop_out_of_domain and out.get("confidence") == "out_of_domain":
+                out["pIC50"] = None
+                out["IC50_nM"] = None
+                out["binding_affinity_kcal"] = None
+            record["targets"][target] = out
+
+        if data.include_novelty and NOVELTY_AVAILABLE and _novelty is not None:
+            record["novelty"] = _novelty.score(canonical).to_dict()
+
+        if data.include_selectivity and SELECTIVITY_AVAILABLE and _selectivity is not None:
+            record["selectivity"] = _selectivity.profile(
+                canonical, data.primary_target).to_dict()
+
+        results.append(record)
+
+    if not results:
+        raise HTTPException(
+            status_code=400,
+            detail=f"None of the {len(data.smiles)} inputs could be parsed"
+        )
+
+    # Rank by primary-target potency, in-domain first
+    tier = {"high": 3, "medium": 2, "low": 1, "out_of_domain": 0}
+
+    def sort_key(r):
+        entry = r["targets"].get(data.primary_target) or {}
+        return (
+            tier.get(entry.get("confidence"), 0),
+            entry.get("pIC50") if entry.get("pIC50") is not None else -99,
+        )
+
+    results.sort(key=sort_key, reverse=True)
+
+    primary_conf = [
+        (r["targets"].get(data.primary_target) or {}).get("confidence")
+        for r in results
+    ]
+
+    return {
+        "primary_target": data.primary_target,
+        "n_submitted": len(data.smiles),
+        "n_screened": len(results),
+        "n_invalid": len(invalid),
+        "invalid": invalid[:50],
+        "summary": {
+            "in_domain": sum(1 for c in primary_conf if c and c != "out_of_domain"),
+            "out_of_domain": sum(1 for c in primary_conf if c == "out_of_domain"),
+            "known_compounds": sum(
+                1 for r in results
+                if r.get("novelty", {}).get("is_duplicate")
+            ),
+            "selective": sum(
+                1 for r in results
+                if r.get("selectivity", {}).get("verdict")
+                in ("selective", "modestly_selective")
+            ),
+        },
+        "results": results,
+    }
+
 
 # Serve static files
 static_path = Path(__file__).parent

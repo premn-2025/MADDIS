@@ -1,6 +1,17 @@
 [server]
-enableCORS = false
-enableXsrfProtection = false
+# XSRF protection guards the file-upload endpoint against cross-site request
+# forgery. The Batch Screening page accepts uploads, so this must stay on for
+# any publicly reachable deployment.
+#
+# It was previously disabled together with enableCORS - the usual workaround
+# for upload trouble behind a reverse proxy. If uploads misbehave on a custom
+# host, fix the proxy headers rather than turning this off.
+enableXsrfProtection = true
+enableCORS = true
+
+# Uploaded SMILES/CSV libraries are text; 20 MB is ample and keeps a stray
+# large file from exhausting the container's memory.
+maxUploadSize = 20
 
 [browser]
 gatherUsageStats = false

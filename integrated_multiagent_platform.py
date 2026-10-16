@@ -126,10 +126,15 @@ except ImportError:
 
 LITERATURE_MINING_AVAILABLE = False
 
-# Import QSAR predictor (lightweight - only needs rdkit + sklearn)
+# Import QSAR predictor (lightweight - only needs rdkit + sklearn).
+# allow_domain_build=False: building a missing applicability-domain cache
+# fingerprints every training molecule and takes ~40s across the five targets,
+# which would stall the page on a cold container. The caches are committed to
+# models/*_ad.npz; if one is absent the app degrades to no confidence label
+# rather than blocking, and build_domain_caches.py regenerates it.
 try:
     from qsar_predictor import QSARPredictor
-    _qsar = QSARPredictor()
+    _qsar = QSARPredictor(allow_domain_build=False)
     QSAR_AVAILABLE = _qsar.is_available
     QSAR_TARGETS = _qsar.available_targets if QSAR_AVAILABLE else []
     if QSAR_AVAILABLE:
@@ -138,6 +143,82 @@ except Exception:
     QSAR_AVAILABLE = False
     QSAR_TARGETS = []
     _qsar = None
+
+# Real Ertl-Schuffenhauer synthetic accessibility (RDKit contrib).
+try:
+    from synthetic_accessibility import (
+        SA_AVAILABLE,
+        sa_label,
+        sa_reward,
+        sa_score as sa_score_raw,
+    )
+except Exception:
+    SA_AVAILABLE = False
+
+    def sa_reward(mol, default=0.5):
+        return default
+
+    def sa_score_raw(mol):
+        return None
+
+    def sa_label(mol):
+        return "unknown"
+
+# Novelty against the ChEMBL reference sets (detects memorised training data).
+try:
+    from novelty_scorer import NoveltyScorer
+    _novelty = NoveltyScorer(allow_build=False)
+    NOVELTY_AVAILABLE = _novelty.is_available
+except Exception:
+    NOVELTY_AVAILABLE = False
+    _novelty = None
+
+
+# Scaffold-split R² per target, written by `train_qsar_models.py --compare`.
+# Held-out whole scaffolds, so this is the honest estimate on new chemistry;
+# the random-split figure stored inside each model file is higher because
+# close analogues of the test molecules remain in training. The fallbacks are
+# the values measured on the shipped models, used when the report is absent.
+_SCAFFOLD_R2_FALLBACK = {
+    'EGFR': 0.604, 'BACE1': 0.594, 'JAK2': 0.518,
+    'THROMBIN': 0.425, 'COX2': 0.155,
+}
+_SCAFFOLD_REPORT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'scaffold_split_report.json')
+_scaffold_r2_cache = None
+
+
+def _load_scaffold_r2():
+    """Scaffold-split R² per target, preferring the generated report."""
+    global _scaffold_r2_cache
+    if _scaffold_r2_cache is not None:
+        return _scaffold_r2_cache
+
+    values = dict(_SCAFFOLD_R2_FALLBACK)
+    try:
+        with open(_SCAFFOLD_REPORT, encoding='utf-8') as f:
+            report = json.load(f)
+        for target, splits in report.items():
+            scaffold = (splits or {}).get('scaffold') or {}
+            if isinstance(scaffold.get('test_r2'), (int, float)):
+                values[target] = round(float(scaffold['test_r2']), 3)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            f"Could not read {_SCAFFOLD_REPORT}: {e}")
+
+    _scaffold_r2_cache = values
+    return values
+
+
+# How applicability-domain confidence tiers are shown in results tables.
+_CONFIDENCE_LABELS = {
+    'high': '🟢 high',
+    'medium': '🟡 medium',
+    'low': '🟠 low',
+    'out_of_domain': '🔴 out of domain',
+}
 
 # Import chemical space analytics
 try:
@@ -161,9 +242,26 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS for faster rendering
+# Custom CSS. Colours are defined as tokens so the cards stay legible under
+# both the light and dark Streamlit themes.
 st.markdown("""
 <style>
+:root {
+    --maddis-card-bg: #ffffff;
+    --maddis-card-border: #e2e8f0;
+    --maddis-card-fg: #1f2937;
+    --maddis-card-muted: #4b5563;
+    --maddis-accent: #2a5298;
+}
+@media (prefers-color-scheme: dark) {
+    :root {
+        --maddis-card-bg: #1b2430;
+        --maddis-card-border: #334155;
+        --maddis-card-fg: #e8edf5;
+        --maddis-card-muted: #aab6c8;
+        --maddis-accent: #7aa7ff;
+    }
+}
 .main-header {
     background: linear-gradient(90deg, #1e3c72 0%, #2a5298 100%);
     color: white;
@@ -172,6 +270,44 @@ st.markdown("""
     text-align: center;
     margin-bottom: 30px;
 }
+.main-header h1 { margin: 0 0 6px 0; }
+.main-header p  { margin: 0; opacity: 0.9; }
+
+/* Used by the landing page. This class was referenced but never defined,
+   so the agent cards previously rendered as unstyled text. */
+.agent-card {
+    background: var(--maddis-card-bg);
+    border: 1px solid var(--maddis-card-border);
+    border-left: 4px solid var(--maddis-accent);
+    color: var(--maddis-card-fg);
+    padding: 14px 16px;
+    border-radius: 8px;
+    height: 100%;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+}
+.agent-card h4 { margin: 0 0 8px 0; font-size: 1rem; color: var(--maddis-card-fg); }
+.agent-card p  { margin: 0; font-size: 0.86rem; line-height: 1.5; color: var(--maddis-card-muted); }
+
+/* Gradient capability tiles on the landing page. */
+.cap-card {
+    color: #ffffff;
+    padding: 16px;
+    border-radius: 8px;
+    text-align: center;
+    height: 100%;
+}
+.cap-card h4 { margin: 0 0 8px 0; font-size: 1rem; }
+.cap-card p  { margin: 0; font-size: 0.84rem; line-height: 1.6; }
+.cap-card .cap-new {
+    display: inline-block;
+    background: rgba(255,255,255,0.22);
+    border-radius: 10px;
+    padding: 1px 8px;
+    font-size: 0.68rem;
+    letter-spacing: 0.04em;
+    margin-bottom: 6px;
+}
+
 .stSpinner > div { font-size: 1.2em; }
 </style>
 """, unsafe_allow_html=True)
@@ -412,54 +548,184 @@ class UniversalMultiAgentPlatform:
     def display_multitarget_library_results(self, results):
         pass
 
+    # Landing-page capability tiles. Kept as data so the rows stay even and
+    # the markup stays in one place.
+    _CAPABILITY_TILES = [
+        ("🧬 Molecule Analysis", "#667eea", "#764ba2", False,
+         "3D structure visualization<br>Property calculation<br>Lipinski rule check"),
+        ("💊 Drug Interactions", "#f093fb", "#f5576c", False,
+         "Drug–drug checker<br>Risk assessment<br>Clinical warnings"),
+        ("🔬 ADMET Prediction", "#4facfe", "#00f2fe", False,
+         "Absorption<br>Toxicity<br>Metabolism"),
+        ("🧪 Synthesis Planning", "#43e97b", "#38f9d7", False,
+         "Retrosynthesis<br>Route optimization<br>Real SAScore difficulty"),
+        ("🎯 Binding + Confidence", "#f6d365", "#fda085", True,
+         "5 ChEMBL-trained targets<br>Applicability domain<br>Flags unreliable scores"),
+        ("🆕 Novelty Check", "#a18cd1", "#fbc2eb", True,
+         "Detects memorised compounds<br>Batch diversity<br>Mode-collapse warning"),
+        ("⚖️ Selectivity", "#84fab0", "#8fd3f4", True,
+         "On- vs off-target window<br>Promiscuity flagging<br>Reported in log units"),
+        ("📚 Batch Screening", "#5ee7df", "#b490ca", True,
+         "Upload a whole library<br>Scored on all targets<br>CSV + SDF export"),
+    ]
+
     def show_landing_page(self):
         st.markdown("### Welcome to the Universal Multi-Agent Drug Discovery Platform")
+        st.caption(
+            "Pick an analysis type from the sidebar to begin. Binding "
+            "predictions come from Random Forest QSAR models trained on ChEMBL "
+            "bioactivity data, and every prediction is labelled with how much "
+            "you should trust it."
+        )
+
         if MULTIAGENT_AVAILABLE:
             st.success("🤖 **Multi-Agent System Active**: Advanced autonomous agent analysis available")
-        
-        # Feature Overview
+
+        # Feature overview - two even rows of four
         st.subheader("🎯 Platform Capabilities")
-        cap_cols = st.columns(4)
-        with cap_cols[0]:
-            st.markdown("""
-            <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 15px; border-radius: 8px; text-align: center;">
-            <h4>🧬 Molecule Analysis</h4>
-            <p>• 3D Structure Visualization<br>• Property Calculation<br>• Lipinski Rule Check</p>
-            </div>
-            """, unsafe_allow_html=True)
-        with cap_cols[1]:
-            st.markdown("""
-            <div style="background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); color: white; padding: 15px; border-radius: 8px; text-align: center;">
-            <h4>💊 Drug Interactions</h4>
-            <p>• Drug-Drug Checker<br>• Risk Assessment<br>• Clinical Warnings</p>
-            </div>
-            """, unsafe_allow_html=True)
-        with cap_cols[2]:
-            st.markdown("""
-            <div style="background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%); color: white; padding: 15px; border-radius: 8px; text-align: center;">
-            <h4>🔬 ADMET Prediction</h4>
-            <p>• Absorption<br>• Toxicity<br>• Metabolism</p>
-            </div>
-            """, unsafe_allow_html=True)
-        with cap_cols[3]:
-            st.markdown("""
-            <div style="background: linear-gradient(135deg, #43e97b 0%, #38f9d7 100%); color: white; padding: 15px; border-radius: 8px; text-align: center;">
-            <h4>🧪 Synthesis Planning</h4>
-            <p>• Retrosynthesis<br>• Route Optimization<br>• Cost Estimation</p>
-            </div>
-            """, unsafe_allow_html=True)
-        
+        for row_start in (0, 4):
+            for col, tile in zip(st.columns(4),
+                                 self._CAPABILITY_TILES[row_start:row_start + 4]):
+                title, c1, c2, is_new, body = tile
+                badge = '<span class="cap-new">NEW</span><br>' if is_new else ''
+                with col:
+                    st.markdown(
+                        f'<div class="cap-card" style="background: linear-gradient'
+                        f'(135deg, {c1} 0%, {c2} 100%);">{badge}'
+                        f'<h4>{title}</h4><p>{body}</p></div>',
+                        unsafe_allow_html=True,
+                    )
+            if row_start == 0:
+                st.write("")
+
         st.markdown("---")
-        st.subheader(" Available Agents")
+        self._show_model_transparency()
+
+        st.markdown("---")
+        st.subheader("🤖 Available Agents")
         agent_cols = st.columns(4)
         with agent_cols[0]:
-            st.markdown('<div class="agent-card"><h4>🎨 Molecular Designer</h4><p>• Property prediction<br>• Generation</p></div>', unsafe_allow_html=True)
+            st.markdown('<div class="agent-card"><h4>🎨 Molecular Designer</h4><p>Property prediction<br>De novo generation</p></div>', unsafe_allow_html=True)
         with agent_cols[1]:
-            st.markdown('<div class="agent-card"><h4>🔗 Docking Specialist</h4><p>• Molecular docking<br>• Affinity</p></div>', unsafe_allow_html=True)
+            st.markdown('<div class="agent-card"><h4>🔗 Docking Specialist</h4><p>Molecular docking<br>Binding affinity</p></div>', unsafe_allow_html=True)
         with agent_cols[2]:
-            st.markdown('<div class="agent-card"><h4>✅ Validation Critic</h4><p>• Statistical validation<br>• Bias detection</p></div>', unsafe_allow_html=True)
+            st.markdown('<div class="agent-card"><h4>✅ Validation Critic</h4><p>Statistical validation<br>Bias detection</p></div>', unsafe_allow_html=True)
         with agent_cols[3]:
-            st.markdown('<div class="agent-card"><h4>⚗️ Synthesis Planner</h4><p>• Retrosynthesis<br>• Route planning</p></div>', unsafe_allow_html=True)
+            st.markdown('<div class="agent-card"><h4>⚗️ Synthesis Planner</h4><p>Retrosynthesis<br>Route planning</p></div>', unsafe_allow_html=True)
+
+    def _show_model_transparency(self):
+        """Show what the models can and cannot do, with the honest numbers.
+
+        Scaffold-split R² is the figure that matters for new chemistry; a
+        random split leaves close analogues in the training set. Publishing
+        both, including the target that transfers badly, is the point.
+        """
+        st.subheader("📊 Model Performance & Limits")
+
+        if not QSAR_AVAILABLE or _qsar is None:
+            st.warning(
+                "QSAR binding models are not loaded, so binding predictions "
+                "fall back to descriptor heuristics. Run "
+                "`python download_chembl_data.py` then "
+                "`python train_qsar_models.py`."
+            )
+            return
+
+        fallback_r2 = _load_scaffold_r2()
+
+        info = _qsar.get_model_info()
+        rows = []
+        any_in_domain = False
+        for target in QSAR_TARGETS:
+            meta = info.get(target, {})
+            if not meta.get('loaded'):
+                continue
+
+            def num(value, digits=3):
+                return round(value, digits) if isinstance(value, (int, float)) else '—'
+
+            # Prefer the figure recorded in the model file; fall back to the
+            # measured constants for models trained before that was stored.
+            scaffold = meta.get('scaffold_r2')
+            if not isinstance(scaffold, (int, float)):
+                scaffold = fallback_r2.get(target)
+
+            row = {
+                'Target': target,
+                'Training molecules': meta.get('n_training', '—'),
+                'R² (random split)': num(meta.get('test_r2')),
+                'R² (new scaffolds)': num(scaffold),
+                'Error (log units)': num(meta.get('test_rmse'), 2),
+            }
+
+            if isinstance(meta.get('in_domain_r2'), (int, float)):
+                any_in_domain = True
+                row['R² (in domain)'] = num(meta['in_domain_r2'])
+                cov = meta.get('in_domain_coverage')
+                row['Domain coverage'] = (f"{cov * 100:.0f}%"
+                                          if isinstance(cov, (int, float)) else '—')
+
+            rows.append(row)
+
+        missing_domain = [
+            t for t in QSAR_TARGETS
+            if not (info.get(t, {}) or {}).get('applicability_domain')
+        ]
+        if missing_domain:
+            st.warning(
+                f"⚠️ Confidence labelling is unavailable for "
+                f"{', '.join(missing_domain)} — the applicability-domain "
+                f"caches are missing from `models/`. Predictions are still "
+                f"shown but cannot be marked reliable or not. Run "
+                f"`python build_domain_caches.py` and redeploy."
+            )
+
+        if rows:
+            st.dataframe(pd.DataFrame(rows), hide_index=True,
+                         use_container_width=True)
+            caption = (
+                "**R² (new scaffolds)** is the number that matters: it holds "
+                "out whole chemical scaffolds, so it measures performance on "
+                "chemistry the model has never seen. The random-split column "
+                "is higher because close analogues of the test molecules "
+                "remain in training."
+            )
+            if any_in_domain:
+                caption += (
+                    " **R² (in domain)** restricts that same held-out set to "
+                    "the molecules the confidence check accepts — which is what "
+                    "you actually get when the app labels a prediction "
+                    "reliable — over the share of molecules shown under "
+                    "*Domain coverage*."
+                )
+            cox2 = next((r for r in rows if r['Target'] == 'COX2'), None)
+            if cox2 and isinstance(cox2['R² (new scaffolds)'], float):
+                caption += (
+                    f" All five targets beat a mean-prediction baseline on "
+                    f"unseen scaffolds, but **COX2 transfers poorly "
+                    f"({cox2['R² (new scaffolds)']:.2f})** — treat its "
+                    f"predictions on novel scaffolds with caution."
+                )
+            st.caption(caption)
+
+        with st.expander("ℹ️ Why predictions carry a confidence label"):
+            st.markdown(
+                "A Random Forest cannot say *\"I don't know\"*. Given a molecule "
+                "unlike anything in its training set it returns approximately "
+                "the **training-set mean**, and that output looks exactly as "
+                "confident as a real prediction:\n\n"
+                "| Molecule | Predicted JAK2 pIC50 |\n"
+                "|---|---|\n"
+                "| methane (`C`) | 6.74 |\n"
+                "| ruxolitinib (real JAK2 inhibitor) | 8.08 |\n"
+                "| *JAK2 training-set mean* | *7.13* |\n\n"
+                "Every prediction is therefore compared against the nearest "
+                "molecules in that target's training set. Four tiers are "
+                "reported — 🟢 high, 🟡 medium, 🟠 low, 🔴 out of domain — and "
+                "binding rewards are scaled by that reliability, so a molecule "
+                "the model cannot assess scores near zero instead of near the "
+                "mean."
+            )
 
     def run_drug_interaction_checker(self):
         """Drug-Drug Compatibility & Stability Analysis"""
@@ -930,13 +1196,14 @@ class UniversalMultiAgentPlatform:
             "Drug Interaction Checker",
             "ADMET Prediction",
             "Synthesis Planning",
-            "RL Molecule Generation", 
-            "Multi-Target RL", 
-            "Chemical Space Analytics"
+            "RL Molecule Generation",
+            "Multi-Target RL",
+            "Chemical Space Analytics",
+            "Batch Screening"
         ], key="analysis_mode_radio")
-        
+
         # Standalone features - don't show molecule input for these
-        standalone_modes = ["Drug Interaction Checker", "RL Molecule Generation", "Multi-Target RL", "Chemical Space Analytics"]
+        standalone_modes = ["Drug Interaction Checker", "RL Molecule Generation", "Multi-Target RL", "Chemical Space Analytics", "Batch Screening"]
         
         if analysis_mode in standalone_modes:
             # Clear any previous molecule input from session state
@@ -954,6 +1221,8 @@ class UniversalMultiAgentPlatform:
                 self.run_multi_target_rl()
             elif analysis_mode == "Chemical Space Analytics":
                 self.run_chemical_space_analytics()
+            elif analysis_mode == "Batch Screening":
+                self.run_batch_screening()
             return
         
         # Molecule-based analysis modes
@@ -1053,9 +1322,22 @@ class UniversalMultiAgentPlatform:
         if reference_smiles and not seed_smiles:
             seed_smiles = reference_smiles
 
-        # Show QSAR model status
+        # Show which scoring components are live for this run
         if QSAR_AVAILABLE:
-            st.success(f"✅ QSAR binding models active for: {', '.join(QSAR_TARGETS)}")
+            active = [f"QSAR binding ({len(QSAR_TARGETS)} targets)"]
+            if _qsar is not None and _qsar.domain is not None:
+                active.append("confidence gating")
+            if NOVELTY_AVAILABLE:
+                active.append("novelty")
+            if SA_AVAILABLE:
+                active.append("synthetic accessibility")
+            st.success("✅ Scoring with: " + ", ".join(active))
+            st.caption(
+                "Rewards are scaled by applicability-domain reliability, so "
+                "molecules the models cannot assess score near zero rather "
+                "than near the training mean. Molecules already present in "
+                "ChEMBL earn no novelty credit."
+            )
         else:
             st.warning("⚠️ QSAR models not available — using fallback scoring")
         
@@ -1212,13 +1494,25 @@ class UniversalMultiAgentPlatform:
                     binding_score = 0.0
                     binding_source = 'simulated'
                     pic50_val = None
+                    binding_confidence = None
+                    nn_similarity = None
 
                     if qsar and target_protein in qsar.available_targets:
                         pic50_val = qsar.predict_pic50(canonical, target_protein)
                         if pic50_val is not None:
                             binding_score = max(0.0, min(1.0, (pic50_val - 4.0) / 6.0))
                             binding_source = 'QSAR'
-                    
+
+                            # Scale by applicability-domain reliability. Without
+                            # this the forest returns its training mean for
+                            # molecules it has never seen anything like, and the
+                            # generator gets rewarded for chemical nonsense.
+                            report = qsar.assess_domain(canonical, target_protein)
+                            if report is not None:
+                                binding_score *= report.reliability
+                                binding_confidence = report.confidence
+                                nn_similarity = report.nn_similarity
+
                     if binding_source == 'simulated':
                         # Fallback: penalise — don't pretend we know binding
                         binding_score = 0.3
@@ -1237,23 +1531,35 @@ class UniversalMultiAgentPlatform:
                     prop_score = max(0.0, prop_score)
 
                     # 4. Synthetic accessibility (weight 0.10)
-                    from rdkit.Chem import rdMolDescriptors as rdmd
-                    try:
-                        from sascorer import calculateScore as sa_calc
-                        sa_raw = sa_calc(mol)
-                    except ImportError:
-                        # Approximate SA from descriptor complexity
-                        sa_raw = min(6, max(1, num_atoms / 8.0))
-                    sa_score = max(0.0, (6 - sa_raw) / 5.0)
+                    # Real Ertl-Schuffenhauer SAScore via synthetic_accessibility,
+                    # which puts RDKit's contrib directory on the path. The old
+                    # inline fallback here was num_atoms/8.0 — effectively
+                    # "bigger is harder", which cannot distinguish a linear
+                    # alkane from a bridged polycycle of the same size.
+                    sa_score = sa_reward(mol)
+                    sa_raw = sa_score_raw(mol)
 
                     # 5/6. ADMET + Safety = 0.15 + 0.15 (default 0.5/1.0 without agents)
                     admet_score = 0.5
                     safety_score = 1.0
 
-                    # 7. Validity (weight 0.05) — already valid
+                    # 7. Validity — already valid
                     validity = 1.0
 
-                    # Weighted total (same weights as ImprovedRLMolecularGenerator)
+                    # 8. Novelty against the ChEMBL reference sets.
+                    # Previously advertised but never computed, so a memorised
+                    # training compound scored as a discovery. Neutral 0.5 when
+                    # the reference caches are unavailable.
+                    novelty_score = 0.5
+                    novelty_report = None
+                    if _novelty is not None and NOVELTY_AVAILABLE:
+                        novelty_report = _novelty.score(canonical)
+                        novelty_score = _novelty.get_novelty_reward(canonical)
+
+                    # Weighted total. Validity drops to 0.03 and novelty takes
+                    # 0.07 — every molecule here is already valid by
+                    # construction, so that weight was dead, while an
+                    # unrewarded novelty term let the generator win by copying.
                     reward = (
                         0.30 * binding_score +
                         0.15 * drug_like +
@@ -1261,7 +1567,8 @@ class UniversalMultiAgentPlatform:
                         0.10 * sa_score +
                         0.15 * admet_score +
                         0.15 * safety_score +
-                        0.05 * validity
+                        0.03 * validity +
+                        0.07 * novelty_score
                     )
 
                     generated.append({
@@ -1270,6 +1577,15 @@ class UniversalMultiAgentPlatform:
                         'binding_affinity': binding_score,
                         'binding_source': binding_source,
                         'pic50': pic50_val,
+                        'binding_confidence': binding_confidence,
+                        'nn_similarity': nn_similarity,
+                        'synthetic_accessibility': sa_raw,
+                        'sa_label': sa_label(mol),
+                        'novelty': novelty_score,
+                        'novelty_similarity': (
+                            novelty_report.max_similarity if novelty_report else None),
+                        'is_known_compound': (
+                            novelty_report.is_duplicate if novelty_report else None),
                         'qed': qed_score,
                         'logp': logp,
                         'mw': mw,
@@ -1375,6 +1691,13 @@ class UniversalMultiAgentPlatform:
                             pic50 = qsar.predict_pic50(mol_data['smiles'], target_name)
                             if pic50 is not None:
                                 binding = max(0.0, min(1.0, (pic50 - 4.0) / 6.0))
+                                # Gate on the applicability domain so a molecule
+                                # outside a target's chemistry cannot score well
+                                # on it just by landing near the training mean.
+                                report = qsar.assess_domain(
+                                    mol_data['smiles'], target_name)
+                                if report is not None:
+                                    binding *= report.reliability
                             else:
                                 binding = 0.3
                         else:
@@ -1409,6 +1732,8 @@ class UniversalMultiAgentPlatform:
                         'Multi-Target Score': f"{r.get('multi_target_score', 0):.3f}",
                         'QED': f"{r['qed']:.3f}",
                         'Binding Source': r.get('binding_source', 'N/A'),
+                        'Confidence': _CONFIDENCE_LABELS.get(
+                            r.get('binding_confidence'), '—'),
                     }
                     # Add per-target scores
                     for tname, _ in targets:
@@ -1531,6 +1856,307 @@ class UniversalMultiAgentPlatform:
                     st.dataframe(df, use_container_width=True)
                 else:
                     st.error("No valid molecules found in input")
+
+    # ------------------------------------------------------------------
+    # Batch screening
+    # ------------------------------------------------------------------
+
+    def run_batch_screening(self):
+        """Screen an uploaded or pasted molecule library against all targets."""
+        st.header("📚 Batch Screening")
+        st.markdown(
+            "Score a whole library against every QSAR target at once, with "
+            "applicability-domain confidence, novelty against ChEMBL, "
+            "synthetic accessibility and cross-target selectivity. "
+            "Export the results as CSV or SDF."
+        )
+
+        if not QSAR_AVAILABLE or _qsar is None:
+            st.error(
+                "QSAR models are not available, so there is nothing to screen "
+                "against. Run `python download_chembl_data.py` then "
+                "`python train_qsar_models.py`."
+            )
+            return
+
+        source = st.radio(
+            "Input", ["Paste SMILES", "Upload file"], horizontal=True,
+            key="batch_source")
+
+        smiles_list = []
+        id_map = {}
+
+        if source == "Paste SMILES":
+            text = st.text_area(
+                "One SMILES per line (an optional name after a space or comma)",
+                height=160,
+                placeholder=(
+                    "CC(=O)Oc1ccccc1C(=O)O aspirin\n"
+                    "CC(C)Cc1ccc(C(C)C(=O)O)cc1 ibuprofen\n"
+                    "Cn1c(=O)c2c(ncn2C)n(C)c1=O caffeine"
+                ),
+                key="batch_text",
+            )
+            for line in (text or "").splitlines():
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                parts = line.replace(',', ' ').split()
+                smi = parts[0]
+                smiles_list.append(smi)
+                if len(parts) > 1:
+                    id_map[smi] = ' '.join(parts[1:])
+        else:
+            uploaded = st.file_uploader(
+                "SMILES (.smi/.txt, one per line) or CSV with a 'smiles' column",
+                type=['smi', 'txt', 'csv'], key="batch_upload")
+            if uploaded is not None:
+                try:
+                    raw = uploaded.getvalue().decode('utf-8', errors='replace')
+                except Exception as e:
+                    st.error(f"Could not read the file: {e}")
+                    return
+
+                if uploaded.name.lower().endswith('.csv'):
+                    import io
+                    df_in = pd.read_csv(io.StringIO(raw))
+                    col = next((c for c in df_in.columns
+                                if c.strip().lower() in ('smiles', 'smile', 'structure')),
+                               None)
+                    if col is None:
+                        st.error(
+                            f"No 'smiles' column found. Columns: "
+                            f"{', '.join(map(str, df_in.columns))}"
+                        )
+                        return
+                    name_col = next((c for c in df_in.columns
+                                     if c.strip().lower() in ('name', 'id', 'compound', 'title')),
+                                    None)
+                    for _, row in df_in.iterrows():
+                        smi = str(row[col]).strip()
+                        if smi and smi.lower() != 'nan':
+                            smiles_list.append(smi)
+                            if name_col:
+                                id_map[smi] = str(row[name_col])
+                else:
+                    for line in raw.splitlines():
+                        line = line.strip()
+                        if not line or line.startswith('#'):
+                            continue
+                        parts = line.replace(',', ' ').split()
+                        smiles_list.append(parts[0])
+                        if len(parts) > 1:
+                            id_map[parts[0]] = ' '.join(parts[1:])
+
+        if not smiles_list:
+            st.info("Provide molecules above to begin.")
+            return
+
+        MAX_BATCH = 2000
+        if len(smiles_list) > MAX_BATCH:
+            st.warning(
+                f"{len(smiles_list):,} molecules supplied; screening the first "
+                f"{MAX_BATCH:,}. Use the API ([web/api_server.py]) for larger "
+                f"libraries."
+            )
+            smiles_list = smiles_list[:MAX_BATCH]
+
+        st.caption(f"{len(smiles_list):,} molecules queued")
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            primary_target = st.selectbox(
+                "Primary target (for selectivity)", QSAR_TARGETS,
+                key="batch_primary")
+        with col_b:
+            hide_unreliable = st.checkbox(
+                "Hide out-of-domain predictions", value=False,
+                key="batch_hide",
+                help="Out-of-domain rows carry a predicted number that is "
+                     "effectively the training mean.")
+
+        if not st.button("🔬 Screen Library", type="primary"):
+            return
+
+        from rdkit.Chem import QED as QED_module
+
+        selectivity = None
+        try:
+            from selectivity_scorer import SelectivityScorer
+            selectivity = SelectivityScorer(predictor=_qsar)
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"Selectivity unavailable: {e}")
+
+        progress = st.progress(0.0)
+        status = st.empty()
+
+        rows = []
+        invalid = []
+
+        for i, smi in enumerate(smiles_list):
+            if i % 10 == 0 or i == len(smiles_list) - 1:
+                progress.progress((i + 1) / len(smiles_list))
+                status.text(f"Scoring {i + 1}/{len(smiles_list)}...")
+
+            mol = Chem.MolFromSmiles(smi)
+            if mol is None:
+                invalid.append(smi)
+                continue
+
+            canonical = Chem.MolToSmiles(mol)
+            row = {
+                'Name': id_map.get(smi, ''),
+                'SMILES': canonical,
+                'MW': round(Descriptors.MolWt(mol), 2),
+                'LogP': round(Descriptors.MolLogP(mol), 2),
+                'TPSA': round(Descriptors.TPSA(mol), 1),
+                'QED': round(QED_module.qed(mol), 3),
+            }
+
+            sa_raw = sa_score_raw(mol)
+            row['SA'] = round(sa_raw, 2) if sa_raw is not None else None
+            row['Synthesis'] = sa_label(mol)
+
+            # Per-target predictions with confidence
+            preds = _qsar.predict_all_targets(canonical)
+            for target in QSAR_TARGETS:
+                entry = preds.get(target)
+                if not entry:
+                    row[f'{target} pIC50'] = None
+                    row[f'{target} conf'] = None
+                    continue
+                conf = entry.get('confidence')
+                if hide_unreliable and conf == 'out_of_domain':
+                    row[f'{target} pIC50'] = None
+                else:
+                    row[f'{target} pIC50'] = entry['pIC50']
+                row[f'{target} conf'] = conf
+
+            # Novelty against the reference sets
+            if _novelty is not None and NOVELTY_AVAILABLE:
+                nov = _novelty.score(canonical)
+                row['Novelty'] = nov.novelty
+                row['Known compound'] = 'yes' if nov.is_duplicate else 'no'
+                row['Nearest set'] = nov.nearest_target
+            else:
+                row['Novelty'] = None
+                row['Known compound'] = None
+                row['Nearest set'] = None
+
+            # Selectivity for the chosen primary target
+            if selectivity is not None:
+                prof = selectivity.profile(canonical, primary_target)
+                row['Selectivity (log)'] = prof.selectivity_log_units
+                row['Best off-target'] = prof.best_off_target
+                row['Selectivity verdict'] = prof.verdict
+            else:
+                row['Selectivity (log)'] = None
+                row['Best off-target'] = None
+                row['Selectivity verdict'] = None
+
+            rows.append(row)
+
+        progress.progress(1.0)
+        status.empty()
+
+        if not rows:
+            st.error("No valid molecules could be parsed.")
+            if invalid:
+                st.caption(f"{len(invalid)} unparseable entries, e.g. {invalid[:3]}")
+            return
+
+        df = pd.DataFrame(rows)
+
+        st.success(f"Screened {len(df):,} molecules.")
+        if invalid:
+            with st.expander(f"⚠️ {len(invalid)} entries could not be parsed"):
+                st.code('\n'.join(invalid[:50]))
+
+        # Summary
+        c1, c2, c3, c4 = st.columns(4)
+        pic_col = f'{primary_target} pIC50'
+        conf_col = f'{primary_target} conf'
+        with c1:
+            in_dom = int((df[conf_col] != 'out_of_domain').sum()) if conf_col in df else 0
+            st.metric(f"In domain for {primary_target}", f"{in_dom}/{len(df)}")
+        with c2:
+            if pic_col in df:
+                potent = int((df[pic_col].fillna(0) >= 7.0).sum())
+                st.metric("Predicted pIC50 ≥ 7", potent)
+        with c3:
+            if 'Known compound' in df:
+                known = int((df['Known compound'] == 'yes').sum())
+                st.metric("Already in ChEMBL", known)
+        with c4:
+            if 'Selectivity verdict' in df:
+                sel = int(df['Selectivity verdict'].isin(
+                    ['selective', 'modestly_selective']).sum())
+                st.metric("Selective hits", sel)
+
+        # Sort by primary target potency, keeping in-domain first
+        if pic_col in df.columns:
+            df = df.sort_values(
+                by=[conf_col, pic_col],
+                key=lambda s: s.map(
+                    {'high': 3, 'medium': 2, 'low': 1, 'out_of_domain': 0}
+                ) if s.name == conf_col else s,
+                ascending=[False, False],
+            ).reset_index(drop=True)
+
+        st.markdown("### 📋 Results")
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+        # Exports
+        st.markdown("### 💾 Export")
+        e1, e2 = st.columns(2)
+        with e1:
+            st.download_button(
+                "⬇️ Download CSV",
+                data=df.to_csv(index=False).encode('utf-8'),
+                file_name=f"maddis_screen_{primary_target}.csv",
+                mime="text/csv",
+            )
+        with e2:
+            sdf = self._rows_to_sdf(df)
+            if sdf:
+                st.download_button(
+                    "⬇️ Download SDF",
+                    data=sdf.encode('utf-8'),
+                    file_name=f"maddis_screen_{primary_target}.sdf",
+                    mime="chemical/x-mdl-sdfile",
+                )
+
+    @staticmethod
+    def _rows_to_sdf(df) -> str:
+        """Serialise screening results to SDF, carrying scores as properties."""
+        import io as io_module
+
+        from rdkit.Chem import AllChem as _AllChem
+
+        buf = io_module.StringIO()
+        writer = Chem.SDWriter(buf)
+        try:
+            for _, row in df.iterrows():
+                mol = Chem.MolFromSmiles(row['SMILES'])
+                if mol is None:
+                    continue
+                # 2D coordinates so the SDF opens sensibly in a viewer
+                try:
+                    _AllChem.Compute2DCoords(mol)
+                except Exception:
+                    pass
+                if row.get('Name'):
+                    mol.SetProp('_Name', str(row['Name']))
+                for key, value in row.items():
+                    if key in ('SMILES', 'Name') or value is None:
+                        continue
+                    if isinstance(value, float) and pd.isna(value):
+                        continue
+                    mol.SetProp(str(key), str(value))
+                writer.write(mol)
+        finally:
+            writer.close()
+        return buf.getvalue()
 
     def run_multiagent_analysis_ui(self, mol, smiles, name):
         """Multi-Agent Analysis UI"""
@@ -1723,21 +2349,28 @@ if __name__ == "__main__":
                 st.session_state.platform = UniversalMultiAgentPlatform()
             st.session_state.app_loaded = True
     
-    # Show feature availability status in sidebar (only once)
-    if 'status_shown' not in st.session_state:
-        status_messages = []
-        if not MULTIAGENT_AVAILABLE:
-            status_messages.append("ℹ️ Multi-agent system: Not available")
-        if not REAL_DOCKING_AVAILABLE:
-            status_messages.append("ℹ️ Real docking: Not available")
-        if not RL_GENERATOR_AVAILABLE:
-            status_messages.append("ℹ️ RL generator: Not available")
-        if not CHAT_ASSISTANT_AVAILABLE:
-            status_messages.append("ℹ️ Chat assistant: Not available")
-        
-        if status_messages and st.sidebar.checkbox("Show System Status", value=False):
-            for msg in status_messages:
-                st.sidebar.info(msg)
-        st.session_state.status_shown = True
+    # Feature availability, in the sidebar behind a toggle
+    with st.sidebar:
+        st.markdown("---")
+        if st.checkbox("Show system status", value=False, key="show_system_status"):
+            subsystems = [
+                ("QSAR binding models", QSAR_AVAILABLE),
+                ("Applicability domain", bool(_qsar is not None and _qsar.domain)),
+                ("Novelty checking", NOVELTY_AVAILABLE),
+                ("Synthetic accessibility", SA_AVAILABLE),
+                ("Multi-agent system", MULTIAGENT_AVAILABLE),
+                ("RL generator", RL_GENERATOR_AVAILABLE),
+                ("Real docking", REAL_DOCKING_AVAILABLE),
+                ("Chat assistant", CHAT_ASSISTANT_AVAILABLE),
+            ]
+            for label, ok in subsystems:
+                st.markdown(f"{'✅' if ok else '➖'} {label}")
+
+            if not all(ok for _, ok in subsystems):
+                st.caption(
+                    "Greyed-out items need optional dependencies "
+                    "(`torch`, `vina`) or an API key. Everything else "
+                    "degrades gracefully."
+                )
     
     st.session_state.platform.run()
